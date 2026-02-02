@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Windows Security Audit Tool - Compliance Edition v1.1.0
+    Windows Security Audit Tool - Compliance Edition v1.3.0
     
 .DESCRIPTION
     A PowerShell 5.0 compatible security configuration auditing tool designed for 
@@ -46,7 +46,7 @@ param(
 # CONFIGURATION & GLOBALS
 # ============================================================================
 
-$Script:AuditVersion = "1.1.0"
+$Script:AuditVersion = "1.3.0"
 $Script:AuditDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 $Script:Hostname = $env:COMPUTERNAME
 $Script:Findings = [System.Collections.ArrayList]::new()
@@ -248,7 +248,7 @@ function Get-SystemInformation {
     
     # CRITICAL: Warn if not running as admin
     if (-not $Script:SystemInfo.IsAdmin) {
-        Add-Finding -Category "System Info" -Name "⛔ SCAN RUN WITHOUT ADMIN RIGHTS" -Risk "Critical" `
+        Add-Finding -Category "System Info" -Name "[!!] SCAN RUN WITHOUT ADMIN RIGHTS" -Risk "Critical" `
             -Description "This audit was NOT run with administrative privileges - RESULTS ARE INCOMPLETE" `
             -Details "Many security checks require admin rights to access protected settings, registry keys, and system configuration. The findings in this report do not represent the complete security posture of this system.`n`nAffected areas include: Security policies, BitLocker, Credential Guard, LSA protection, Windows Defender configuration, audit policies, user rights, driver signing, and many others." `
             -Recommendation "RE-RUN THIS AUDIT FROM AN ELEVATED POWERSHELL PROMPT (Run as Administrator) to get complete and accurate results." `
@@ -424,19 +424,19 @@ function Get-CyberEssentialsSummary {
     
     # Check MDM
     if ($Script:MDMStatus -and $Script:MDMStatus.IsEnrolled) {
-        $Script:CyberEssentials.SecureConfiguration.Details += "✓ MDM Enrolled"
+        $Script:CyberEssentials.SecureConfiguration.Details += "[OK] MDM Enrolled"
     } else {
         $secConfigIssues++
-        $Script:CyberEssentials.SecureConfiguration.Details += "✗ Not MDM Enrolled"
+        $Script:CyberEssentials.SecureConfiguration.Details += "[FAIL] Not MDM Enrolled"
     }
     
     # Check UAC
     $uacEnabled = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -Default 0
     if ($uacEnabled -eq 1) {
-        $Script:CyberEssentials.SecureConfiguration.Details += "✓ UAC Enabled"
+        $Script:CyberEssentials.SecureConfiguration.Details += "[OK] UAC Enabled"
     } else {
         $secConfigIssues++
-        $Script:CyberEssentials.SecureConfiguration.Details += "✗ UAC Disabled"
+        $Script:CyberEssentials.SecureConfiguration.Details += "[FAIL] UAC Disabled"
     }
     
     # Check for old third-party software
@@ -447,11 +447,11 @@ function Get-CyberEssentialsSummary {
         })
         if ($oldThirdParty.Count -gt 10) {
             $secConfigIssues++
-            $Script:CyberEssentials.SecureConfiguration.Details += "✗ $($oldThirdParty.Count) old third-party apps (>2 years)"
+            $Script:CyberEssentials.SecureConfiguration.Details += "[FAIL] $($oldThirdParty.Count) old third-party apps (>2 years)"
         } elseif ($oldThirdParty.Count -gt 0) {
-            $Script:CyberEssentials.SecureConfiguration.Details += "⚠ $($oldThirdParty.Count) old third-party apps"
+            $Script:CyberEssentials.SecureConfiguration.Details += "[WARN] $($oldThirdParty.Count) old third-party apps"
         } else {
-            $Script:CyberEssentials.SecureConfiguration.Details += "✓ No old third-party software"
+            $Script:CyberEssentials.SecureConfiguration.Details += "[OK] No old third-party software"
         }
     }
     
@@ -467,17 +467,17 @@ function Get-CyberEssentialsSummary {
         
         if ($adminCount -gt 3) {
             $uacIssues++
-            $Script:CyberEssentials.UserAccessControl.Details += "✗ $adminCount local admin accounts (recommend ≤3)"
+            $Script:CyberEssentials.UserAccessControl.Details += "[FAIL] $adminCount local admin accounts (recommend <=3)"
         } else {
-            $Script:CyberEssentials.UserAccessControl.Details += "✓ $adminCount local admin accounts"
+            $Script:CyberEssentials.UserAccessControl.Details += "[OK] $adminCount local admin accounts"
         }
     } catch {
-        $Script:CyberEssentials.UserAccessControl.Details += "⚠ Could not enumerate admins"
+        $Script:CyberEssentials.UserAccessControl.Details += "[WARN] Could not enumerate admins"
     }
     
     # Check if current user is admin for daily use
     if ($Script:SystemInfo.IsAdmin) {
-        $Script:CyberEssentials.UserAccessControl.Details += "⚠ Current session running as admin"
+        $Script:CyberEssentials.UserAccessControl.Details += "[WARN] Current session running as admin"
     }
     
     # Check Guest account
@@ -485,9 +485,9 @@ function Get-CyberEssentialsSummary {
         $guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
         if ($guest -and $guest.Enabled) {
             $uacIssues++
-            $Script:CyberEssentials.UserAccessControl.Details += "✗ Guest account enabled"
+            $Script:CyberEssentials.UserAccessControl.Details += "[FAIL] Guest account enabled"
         } else {
-            $Script:CyberEssentials.UserAccessControl.Details += "✓ Guest account disabled"
+            $Script:CyberEssentials.UserAccessControl.Details += "[OK] Guest account disabled"
         }
     } catch { }
     
@@ -501,29 +501,29 @@ function Get-CyberEssentialsSummary {
         $defenderStatus = Get-MpComputerStatus -ErrorAction Stop
         
         if ($defenderStatus.AntivirusEnabled) {
-            $Script:CyberEssentials.MalwareProtection.Details += "✓ Windows Defender enabled"
+            $Script:CyberEssentials.MalwareProtection.Details += "[OK] Windows Defender enabled"
         } else {
             $malwareIssues++
-            $Script:CyberEssentials.MalwareProtection.Details += "✗ Windows Defender disabled"
+            $Script:CyberEssentials.MalwareProtection.Details += "[FAIL] Windows Defender disabled"
         }
         
         if ($defenderStatus.RealTimeProtectionEnabled) {
-            $Script:CyberEssentials.MalwareProtection.Details += "✓ Real-time protection on"
+            $Script:CyberEssentials.MalwareProtection.Details += "[OK] Real-time protection on"
         } else {
             $malwareIssues++
-            $Script:CyberEssentials.MalwareProtection.Details += "✗ Real-time protection off"
+            $Script:CyberEssentials.MalwareProtection.Details += "[FAIL] Real-time protection off"
         }
         
         if ($defenderStatus.AntivirusSignatureAge -le 1) {
-            $Script:CyberEssentials.MalwareProtection.Details += "✓ Signatures up to date"
+            $Script:CyberEssentials.MalwareProtection.Details += "[OK] Signatures up to date"
         } elseif ($defenderStatus.AntivirusSignatureAge -le 7) {
-            $Script:CyberEssentials.MalwareProtection.Details += "⚠ Signatures $($defenderStatus.AntivirusSignatureAge) days old"
+            $Script:CyberEssentials.MalwareProtection.Details += "[WARN] Signatures $($defenderStatus.AntivirusSignatureAge) days old"
         } else {
             $malwareIssues++
-            $Script:CyberEssentials.MalwareProtection.Details += "✗ Signatures $($defenderStatus.AntivirusSignatureAge) days old"
+            $Script:CyberEssentials.MalwareProtection.Details += "[FAIL] Signatures $($defenderStatus.AntivirusSignatureAge) days old"
         }
     } catch {
-        $Script:CyberEssentials.MalwareProtection.Details += "⚠ Could not check Defender status"
+        $Script:CyberEssentials.MalwareProtection.Details += "[WARN] Could not check Defender status"
     }
     
     $Script:CyberEssentials.MalwareProtection.Status = if ($malwareIssues -eq 0) { "PASS" } elseif ($malwareIssues -eq 1) { "REVIEW" } else { "FAIL" }
@@ -536,9 +536,9 @@ function Get-CyberEssentialsSummary {
     $wuService = Get-Service -Name "wuauserv" -ErrorAction SilentlyContinue
     if ($wuService -and $wuService.StartType -eq 'Disabled') {
         $patchIssues++
-        $Script:CyberEssentials.PatchManagement.Details += "✗ Windows Update service disabled"
+        $Script:CyberEssentials.PatchManagement.Details += "[FAIL] Windows Update service disabled"
     } else {
-        $Script:CyberEssentials.PatchManagement.Details += "✓ Windows Update service enabled"
+        $Script:CyberEssentials.PatchManagement.Details += "[OK] Windows Update service enabled"
     }
     
     # Check if automatic updates are configured
@@ -548,13 +548,13 @@ function Get-CyberEssentialsSummary {
     
     if ($noAutoUpdate -eq 1 -or $auOptions -eq 1) {
         $patchIssues++
-        $Script:CyberEssentials.PatchManagement.Details += "✗ Automatic updates disabled"
+        $Script:CyberEssentials.PatchManagement.Details += "[FAIL] Automatic updates disabled"
     } elseif ($auOptions -eq 4) {
-        $Script:CyberEssentials.PatchManagement.Details += "✓ Auto-install updates enabled"
+        $Script:CyberEssentials.PatchManagement.Details += "[OK] Auto-install updates enabled"
     } elseif ($auOptions -in @(2, 3)) {
-        $Script:CyberEssentials.PatchManagement.Details += "⚠ Updates require manual install"
+        $Script:CyberEssentials.PatchManagement.Details += "[WARN] Updates require manual install"
     } else {
-        $Script:CyberEssentials.PatchManagement.Details += "✓ Using Windows default updates"
+        $Script:CyberEssentials.PatchManagement.Details += "[OK] Using Windows default updates"
     }
     
     # Check WSUS configuration for security issues
@@ -565,14 +565,14 @@ function Get-CyberEssentialsSummary {
     if ($wsusServer -and $useWUServer -eq 1) {
         if ($wsusServer -match '^http://') {
             $patchIssues++
-            $Script:CyberEssentials.PatchManagement.Details += "✗ WSUS uses HTTP (insecure)"
+            $Script:CyberEssentials.PatchManagement.Details += "[FAIL] WSUS uses HTTP (insecure)"
         } else {
-            $Script:CyberEssentials.PatchManagement.Details += "✓ WSUS uses HTTPS"
+            $Script:CyberEssentials.PatchManagement.Details += "[OK] WSUS uses HTTPS"
         }
         
         $serverName = $wsusServer -replace '^https?://' -replace '/.*$' -replace ':\d+$'
         if ($serverName -notmatch '\.') {
-            $Script:CyberEssentials.PatchManagement.Details += "⚠ WSUS uses NetBIOS name"
+            $Script:CyberEssentials.PatchManagement.Details += "[WARN] WSUS uses NetBIOS name"
         }
     }
     
@@ -584,16 +584,16 @@ function Get-CyberEssentialsSummary {
             $daysSinceUpdate = if ($latestHotfix.InstalledOn) { ((Get-Date) - $latestHotfix.InstalledOn).Days } else { $null }
             
             if ($daysSinceUpdate -and $daysSinceUpdate -le 30) {
-                $Script:CyberEssentials.PatchManagement.Details += "✓ Updated within 30 days"
+                $Script:CyberEssentials.PatchManagement.Details += "[OK] Updated within 30 days"
             } elseif ($daysSinceUpdate -and $daysSinceUpdate -le 60) {
-                $Script:CyberEssentials.PatchManagement.Details += "⚠ Last update $daysSinceUpdate days ago"
+                $Script:CyberEssentials.PatchManagement.Details += "[WARN] Last update $daysSinceUpdate days ago"
             } elseif ($daysSinceUpdate) {
                 $patchIssues++
-                $Script:CyberEssentials.PatchManagement.Details += "✗ Last update $daysSinceUpdate days ago"
+                $Script:CyberEssentials.PatchManagement.Details += "[FAIL] Last update $daysSinceUpdate days ago"
             }
         }
     } catch {
-        $Script:CyberEssentials.PatchManagement.Details += "⚠ Could not check hotfix history"
+        $Script:CyberEssentials.PatchManagement.Details += "[WARN] Could not check hotfix history"
     }
     
     # Check Windows build
@@ -602,10 +602,10 @@ function Get-CyberEssentialsSummary {
     $isSupported = if ($isWindows11) { $build -ge 22621 } else { $build -ge 19044 }
     
     if ($isSupported) {
-        $Script:CyberEssentials.PatchManagement.Details += "✓ Windows build supported ($build)"
+        $Script:CyberEssentials.PatchManagement.Details += "[OK] Windows build supported ($build)"
     } else {
         $patchIssues++
-        $Script:CyberEssentials.PatchManagement.Details += "✗ Windows build may be unsupported ($build)"
+        $Script:CyberEssentials.PatchManagement.Details += "[FAIL] Windows build may be unsupported ($build)"
     }
     
     $Script:CyberEssentials.PatchManagement.Status = if ($patchIssues -eq 0) { "PASS" } elseif ($patchIssues -eq 1) { "REVIEW" } else { "FAIL" }
@@ -3679,16 +3679,16 @@ function New-HtmlReport {
     
     # Determine admin status display for header
     $headerAdminStatus = if ($Script:SystemInfo.IsAdmin) {
-        "<span style='color: #90EE90;'>✓ Administrator</span>"
+        "<span style='color: #90EE90;'>[OK] Administrator</span>"
     } else {
-        "<span style='color: #ff6b6b; font-weight: bold;'>⛔ NOT ADMIN - LIMITED RESULTS</span>"
+        "<span style='color: #ff6b6b; font-weight: bold;'>[!!] NOT ADMIN - LIMITED RESULTS</span>"
     }
     
     # Determine page title
     $pageTitle = if ($Script:SystemInfo.IsAdmin) {
         "Windows Security Audit Report - $($Script:Hostname)"
     } else {
-        "⚠️ INCOMPLETE - Windows Security Audit Report - $($Script:Hostname)"
+        "[WARN] INCOMPLETE - Windows Security Audit Report - $($Script:Hostname)"
     }
     
     $html = @"
@@ -4112,7 +4112,7 @@ function New-HtmlReport {
     <div class="container">
         <header class="header">
             <div>
-                <h1>🛡️ Windows Security Audit Report</h1>
+                <h1>Windows Security Audit Report</h1>
                 <div class="header-meta">
                     <div><strong>Hostname:</strong> $($Script:SystemInfo.Hostname)</div>
                     <div><strong>Audit Date:</strong> $($Script:AuditDate)</div>
@@ -4135,7 +4135,7 @@ function New-HtmlReport {
     if (-not $Script:SystemInfo.IsAdmin) {
         $html += @"
         <div class="admin-warning">
-            <h2>⛔ LIMITED SCAN - NOT RUNNING AS ADMINISTRATOR</h2>
+            <h2>[!!] LIMITED SCAN - NOT RUNNING AS ADMINISTRATOR</h2>
             <p>This audit was executed <strong>without administrative privileges</strong>. The results are <strong>incomplete</strong> and may not reflect the true security posture of this system.</p>
             <p><strong>The following checks are affected or unavailable:</strong></p>
             <ul>
@@ -4149,7 +4149,7 @@ function New-HtmlReport {
                 <li>Hardware security features (Secure Boot, TPM, VBS)</li>
                 <li>Many other security-critical settings</li>
             </ul>
-            <p style="margin-top: 15px;"><strong>⚠️ ACTION REQUIRED:</strong> Re-run this audit from an elevated PowerShell prompt (Run as Administrator) for complete results.</p>
+            <p style="margin-top: 15px;"><strong>[WARN] ACTION REQUIRED:</strong> Re-run this audit from an elevated PowerShell prompt (Run as Administrator) for complete results.</p>
         </div>
         
 "@
@@ -4157,7 +4157,7 @@ function New-HtmlReport {
 
     $html += @"
         <div class="disclaimer">
-            <strong>⚠️ Disclaimer:</strong> This report is generated for authorized security compliance auditing purposes only. 
+            <strong>[WARN] Disclaimer:</strong> This report is generated for authorized security compliance auditing purposes only. 
             Findings should be validated by qualified security personnel before taking remediation actions.$(if (-not $Script:SystemInfo.IsAdmin) { " <strong>NOTE: This scan was run without admin rights - results are incomplete.</strong>" })
         </div>
         
@@ -4197,34 +4197,34 @@ function New-HtmlReport {
     
     $html += @"
         <div class="cyber-essentials">
-            <h3>🔐 Cyber Essentials Assessment Summary <span style="float: right; font-size: 14px; color: $ceScoreColor;">Readiness Score: $($Script:CyberEssentialsScore)%</span></h3>
+            <h3>CYBER ESSENTIALS Assessment Summary <span style="float: right; font-size: 14px; color: $ceScoreColor;">Readiness Score: $($Script:CyberEssentialsScore)%</span></h3>
             <div class="ce-grid">
                 <div class="ce-item $ceFirewallClass">
-                    <h4>🛡️ Firewalls <span class="ce-status $ceFirewallClass">$($Script:CyberEssentials.Firewalls.Status)</span></h4>
+                    <h4>FIREWALLS <span class="ce-status $ceFirewallClass">$($Script:CyberEssentials.Firewalls.Status)</span></h4>
                     <div class="ce-details">
                         $($Script:CyberEssentials.Firewalls.Details | ForEach-Object { "<div>$_</div>" })
                     </div>
                 </div>
                 <div class="ce-item $ceSecConfigClass">
-                    <h4>⚙️ Secure Configuration <span class="ce-status $ceSecConfigClass">$($Script:CyberEssentials.SecureConfiguration.Status)</span></h4>
+                    <h4>SECURE CONFIG <span class="ce-status $ceSecConfigClass">$($Script:CyberEssentials.SecureConfiguration.Status)</span></h4>
                     <div class="ce-details">
                         $($Script:CyberEssentials.SecureConfiguration.Details | ForEach-Object { "<div>$_</div>" })
                     </div>
                 </div>
                 <div class="ce-item $ceUserAccessClass">
-                    <h4>👤 User Access Control <span class="ce-status $ceUserAccessClass">$($Script:CyberEssentials.UserAccessControl.Status)</span></h4>
+                    <h4>ACCESS CONTROL <span class="ce-status $ceUserAccessClass">$($Script:CyberEssentials.UserAccessControl.Status)</span></h4>
                     <div class="ce-details">
                         $($Script:CyberEssentials.UserAccessControl.Details | ForEach-Object { "<div>$_</div>" })
                     </div>
                 </div>
                 <div class="ce-item $ceMalwareClass">
-                    <h4>🦠 Malware Protection <span class="ce-status $ceMalwareClass">$($Script:CyberEssentials.MalwareProtection.Status)</span></h4>
+                    <h4>MALWARE <span class="ce-status $ceMalwareClass">$($Script:CyberEssentials.MalwareProtection.Status)</span></h4>
                     <div class="ce-details">
                         $($Script:CyberEssentials.MalwareProtection.Details | ForEach-Object { "<div>$_</div>" })
                     </div>
                 </div>
                 <div class="ce-item $cePatchClass">
-                    <h4>🔄 Patch Management <span class="ce-status $cePatchClass">$($Script:CyberEssentials.PatchManagement.Status)</span></h4>
+                    <h4>PATCHING <span class="ce-status $cePatchClass">$($Script:CyberEssentials.PatchManagement.Status)</span></h4>
                     <div class="ce-details">
                         $($Script:CyberEssentials.PatchManagement.Details | ForEach-Object { "<div>$_</div>" })
                     </div>
@@ -4233,7 +4233,7 @@ function New-HtmlReport {
         </div>
         
         <div class="toc">
-            <h3>📋 Table of Contents</h3>
+            <h3>Table of Contents</h3>
             <ul>
 "@
     
@@ -4246,13 +4246,13 @@ function New-HtmlReport {
     
     # Add Software Inventory link if inventory exists
     if ($Script:SoftwareInventory -and $Script:SoftwareInventory.Count -gt 0) {
-        $html += "                <li><a href='#software-inventory'>📦 Software Inventory ($($Script:SoftwareInventory.Count))</a></li>`n"
+        $html += "                <li><a href='#software-inventory'>Software Inventory ($($Script:SoftwareInventory.Count))</a></li>`n"
     }
     
     $adminStatusHtml = if ($Script:SystemInfo.IsAdmin) {
-        "<span style='color: #28a745; font-weight: bold;'>✓ Yes</span>"
+        "<span style='color: #28a745; font-weight: bold;'>[OK] Yes</span>"
     } else {
-        "<span style='color: #dc3545; font-weight: bold;'>⛔ NO - RESULTS INCOMPLETE</span>"
+        "<span style='color: #dc3545; font-weight: bold;'>[!!] NO - RESULTS INCOMPLETE</span>"
     }
     
     $html += @"
@@ -4260,7 +4260,7 @@ function New-HtmlReport {
         </div>
         
         <div class="section">
-            <div class="section-header">💻 System Information</div>
+            <div class="section-header">System Information</div>
             <div class="system-info-grid">
                 <div class="system-info-item"><span class="label">Hostname</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.Hostname)</span></div>
                 <div class="system-info-item"><span class="label">Domain</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.Domain)</span></div>
@@ -4282,7 +4282,7 @@ function New-HtmlReport {
         $html += @"
         
         <div class="software-inventory" id="software-inventory">
-            <h3>📦 Software Inventory ($($Script:SoftwareInventory.Count) applications)</h3>
+            <h3>Software Inventory ($($Script:SoftwareInventory.Count) applications)</h3>
             <div class="inventory-filter">
                 <input type="text" id="softwareSearch" placeholder="Search software..." onkeyup="filterSoftware()">
                 <select id="archFilter" onchange="filterSoftware()">
@@ -4390,8 +4390,8 @@ function New-HtmlReport {
         foreach ($finding in $catFindings) {
             $riskClass = "risk-$($finding.Risk.ToLower())"
             $detailsHtml = if ($finding.Details) { "<div class='finding-details'>$(ConvertTo-HtmlSafe $finding.Details)</div>" } else { "" }
-            $recHtml = if ($finding.Recommendation) { "<div class='recommendation'>💡 $(ConvertTo-HtmlSafe $finding.Recommendation)</div>" } else { "" }
-            $refHtml = if ($finding.Reference) { "<div class='reference'>📚 Reference: $(ConvertTo-HtmlSafe $finding.Reference)</div>" } else { "" }
+            $recHtml = if ($finding.Recommendation) { "<div class='recommendation'>Recommendation: $(ConvertTo-HtmlSafe $finding.Recommendation)</div>" } else { "" }
+            $refHtml = if ($finding.Reference) { "<div class='reference'>Reference: $(ConvertTo-HtmlSafe $finding.Reference)</div>" } else { "" }
             
             $html += @"
                 <div class="finding">
@@ -4434,10 +4434,10 @@ function New-HtmlReport {
 function Start-SecurityAudit {
     $banner = @"
     
-    ╔═══════════════════════════════════════════════════════════════════╗
-    ║     Windows Security Audit Tool - Compliance Edition v$Script:AuditVersion       ║
-    ║                   For Authorized Security Audits                  ║
-    ╚═══════════════════════════════════════════════════════════════════╝
+    +===================================================================+
+    |     Windows Security Audit Tool - Compliance Edition v$Script:AuditVersion       |
+    |                   For Authorized Security Audits                  |
+    +===================================================================+
     
 "@
     
@@ -4533,9 +4533,9 @@ function Start-SecurityAudit {
     $lowCount = @($Script:Findings | Where-Object { $_.Risk -eq 'Low' }).Count
     
     Write-Host "`n" -NoNewline
-    Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "===================================================================" -ForegroundColor Cyan
     Write-Host "                         AUDIT SUMMARY                              " -ForegroundColor White
-    Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "===================================================================" -ForegroundColor Cyan
     Write-Host "  Total Findings: $($Script:Findings.Count)" -ForegroundColor White
     Write-Host "  Critical: " -NoNewline -ForegroundColor White
     Write-Host "$criticalCount" -ForegroundColor Red
@@ -4545,7 +4545,7 @@ function Start-SecurityAudit {
     Write-Host "$mediumCount" -ForegroundColor Yellow
     Write-Host "  Low: " -NoNewline -ForegroundColor White
     Write-Host "$lowCount" -ForegroundColor Cyan
-    Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "===================================================================" -ForegroundColor Cyan
     
     return $reportFile
 }
