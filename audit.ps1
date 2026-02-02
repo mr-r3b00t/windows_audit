@@ -285,6 +285,302 @@ function Get-SystemInformation {
     }
 }
 
+function Test-MDMEnrollment {
+    Write-AuditLog "Checking Mobile Device Management (MDM) Enrollment..." -Level "INFO"
+    
+    $Script:MDMStatus = [PSCustomObject]@{
+        IsEnrolled = $false
+        MDMProvider = $null
+        EnrollmentType = $null
+        Details = @()
+    }
+    
+    # Check for MDM enrollment via registry
+    $mdmEnrollmentPath = "HKLM:\SOFTWARE\Microsoft\Enrollments"
+    $mdmFound = $false
+    
+    if (Test-Path $mdmEnrollmentPath) {
+        $enrollments = Get-ChildItem -Path $mdmEnrollmentPath -ErrorAction SilentlyContinue
+        foreach ($enrollment in $enrollments) {
+            $providerId = Get-RegistryValue -Path $enrollment.PSPath -Name "ProviderId" -Default $null
+            $upn = Get-RegistryValue -Path $enrollment.PSPath -Name "UPN" -Default $null
+            $enrollmentType = Get-RegistryValue -Path $enrollment.PSPath -Name "EnrollmentType" -Default $null
+            
+            if ($providerId) {
+                $mdmFound = $true
+                $Script:MDMStatus.IsEnrolled = $true
+                $Script:MDMStatus.MDMProvider = $providerId
+                $Script:MDMStatus.EnrollmentType = $enrollmentType
+                $Script:MDMStatus.Details += "Provider: $providerId, UPN: $upn"
+            }
+        }
+    }
+    
+    # Check for Intune enrollment specifically
+    $intunePath = "HKLM:\SOFTWARE\Microsoft\IntuneManagementExtension"
+    $intuneEnrolled = Test-Path $intunePath
+    
+    # Check for Azure AD Join status
+    $aadJoined = $false
+    $aadPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo"
+    if (Test-Path $aadPath) {
+        $joinInfo = Get-ChildItem -Path $aadPath -ErrorAction SilentlyContinue
+        if ($joinInfo) {
+            $aadJoined = $true
+            foreach ($info in $joinInfo) {
+                $tenantId = Get-RegistryValue -Path $info.PSPath -Name "TenantId" -Default $null
+                if ($tenantId) {
+                    $Script:MDMStatus.Details += "Azure AD Tenant: $tenantId"
+                }
+            }
+        }
+    }
+    
+    # Check dsregcmd for detailed status (if available)
+    try {
+        $dsregOutput = dsregcmd /status 2>&1
+        if ($dsregOutput -match "AzureAdJoined\s*:\s*YES") {
+            $aadJoined = $true
+        }
+        if ($dsregOutput -match "DomainJoined\s*:\s*YES") {
+            $Script:MDMStatus.Details += "Domain Joined: Yes"
+        }
+        if ($dsregOutput -match "MdmUrl\s*:\s*(\S+)") {
+            $mdmFound = $true
+            $Script:MDMStatus.IsEnrolled = $true
+            $Script:MDMStatus.Details += "MDM URL: $($Matches[1])"
+        }
+    } catch { }
+    
+    # Report findings
+    if ($Script:MDMStatus.IsEnrolled -or $intuneEnrolled) {
+        $details = "MDM Enrollment: Yes"
+        if ($Script:MDMStatus.MDMProvider) { $details += "`nProvider: $($Script:MDMStatus.MDMProvider)" }
+        if ($intuneEnrolled) { $details += "`nMicrosoft Intune: Detected" }
+        if ($aadJoined) { $details += "`nAzure AD Joined: Yes" }
+        $details += "`n$($Script:MDMStatus.Details -join "`n")"
+        
+        Add-Finding -Category "MDM" -Name "Device is MDM Enrolled" -Risk "Info" `
+            -Description "This device is enrolled in Mobile Device Management" `
+            -Details $details `
+            -Reference "Cyber Essentials: Secure Configuration"
+    } else {
+        $details = "MDM Enrollment: Not detected"
+        if ($aadJoined) { $details += "`nAzure AD Joined: Yes (but no MDM)" }
+        
+        Add-Finding -Category "MDM" -Name "Device Not MDM Enrolled" -Risk "Medium" `
+            -Description "This device does not appear to be enrolled in Mobile Device Management" `
+            -Details $details `
+            -Recommendation "Consider enrolling device in MDM (e.g., Microsoft Intune) for centralized management and policy enforcement" `
+            -Reference "Cyber Essentials: Secure Configuration"
+    }
+    
+    $Script:MDMStatus.IsAzureADJoined = $aadJoined
+}
+
+function Get-CyberEssentialsSummary {
+    Write-AuditLog "Generating Cyber Essentials Summary..." -Level "INFO"
+    
+    # Initialize Cyber Essentials assessment
+    $Script:CyberEssentials = @{
+        Firewalls = @{ Status = "Unknown"; Pass = $false; Details = @() }
+        SecureConfiguration = @{ Status = "Unknown"; Pass = $false; Details = @() }
+        UserAccessControl = @{ Status = "Unknown"; Pass = $false; Details = @() }
+        MalwareProtection = @{ Status = "Unknown"; Pass = $false; Details = @() }
+        PatchManagement = @{ Status = "Unknown"; Pass = $false; Details = @() }
+    }
+    
+    # 1. FIREWALLS - Check Windows Firewall status
+    try {
+        $firewallProfiles = Get-NetFirewallProfile -ErrorAction Stop
+        $allEnabled = $true
+        $enabledProfiles = @()
+        $disabledProfiles = @()
+        
+        foreach ($profile in $firewallProfiles) {
+            if ($profile.Enabled) {
+                $enabledProfiles += $profile.Name
+            } else {
+                $allEnabled = $false
+                $disabledProfiles += $profile.Name
+            }
+        }
+        
+        if ($allEnabled) {
+            $Script:CyberEssentials.Firewalls.Status = "PASS"
+            $Script:CyberEssentials.Firewalls.Pass = $true
+            $Script:CyberEssentials.Firewalls.Details += "All firewall profiles enabled: $($enabledProfiles -join ', ')"
+        } else {
+            $Script:CyberEssentials.Firewalls.Status = "FAIL"
+            $Script:CyberEssentials.Firewalls.Details += "Disabled profiles: $($disabledProfiles -join ', ')"
+        }
+    } catch {
+        $Script:CyberEssentials.Firewalls.Status = "UNKNOWN"
+        $Script:CyberEssentials.Firewalls.Details += "Could not check firewall status"
+    }
+    
+    # 2. SECURE CONFIGURATION - MDM, Admin accounts, UAC
+    $secConfigIssues = 0
+    
+    # Check MDM
+    if ($Script:MDMStatus -and $Script:MDMStatus.IsEnrolled) {
+        $Script:CyberEssentials.SecureConfiguration.Details += "✓ MDM Enrolled"
+    } else {
+        $secConfigIssues++
+        $Script:CyberEssentials.SecureConfiguration.Details += "✗ Not MDM Enrolled"
+    }
+    
+    # Check UAC
+    $uacEnabled = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -Default 0
+    if ($uacEnabled -eq 1) {
+        $Script:CyberEssentials.SecureConfiguration.Details += "✓ UAC Enabled"
+    } else {
+        $secConfigIssues++
+        $Script:CyberEssentials.SecureConfiguration.Details += "✗ UAC Disabled"
+    }
+    
+    # Check for old third-party software
+    if ($Script:SoftwareInventory) {
+        $twoYearsAgo = (Get-Date).AddDays(-730)
+        $oldThirdParty = @($Script:SoftwareInventory | Where-Object { 
+            $_.InstallDate -and $_.InstallDate -lt $twoYearsAgo -and -not $_.IsMicrosoft
+        })
+        if ($oldThirdParty.Count -gt 10) {
+            $secConfigIssues++
+            $Script:CyberEssentials.SecureConfiguration.Details += "✗ $($oldThirdParty.Count) old third-party apps (>2 years)"
+        } elseif ($oldThirdParty.Count -gt 0) {
+            $Script:CyberEssentials.SecureConfiguration.Details += "⚠ $($oldThirdParty.Count) old third-party apps"
+        } else {
+            $Script:CyberEssentials.SecureConfiguration.Details += "✓ No old third-party software"
+        }
+    }
+    
+    $Script:CyberEssentials.SecureConfiguration.Status = if ($secConfigIssues -eq 0) { "PASS" } elseif ($secConfigIssues -le 1) { "REVIEW" } else { "FAIL" }
+    $Script:CyberEssentials.SecureConfiguration.Pass = $secConfigIssues -eq 0
+    
+    # 3. USER ACCESS CONTROL - Admin account usage
+    $uacIssues = 0
+    
+    try {
+        $adminGroup = Get-LocalGroupMember -Group "Administrators" -ErrorAction Stop
+        $adminCount = @($adminGroup).Count
+        
+        if ($adminCount -gt 3) {
+            $uacIssues++
+            $Script:CyberEssentials.UserAccessControl.Details += "✗ $adminCount local admin accounts (recommend ≤3)"
+        } else {
+            $Script:CyberEssentials.UserAccessControl.Details += "✓ $adminCount local admin accounts"
+        }
+    } catch {
+        $Script:CyberEssentials.UserAccessControl.Details += "⚠ Could not enumerate admins"
+    }
+    
+    # Check if current user is admin for daily use
+    if ($Script:SystemInfo.IsAdmin) {
+        $Script:CyberEssentials.UserAccessControl.Details += "⚠ Current session running as admin"
+    }
+    
+    # Check Guest account
+    try {
+        $guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+        if ($guest -and $guest.Enabled) {
+            $uacIssues++
+            $Script:CyberEssentials.UserAccessControl.Details += "✗ Guest account enabled"
+        } else {
+            $Script:CyberEssentials.UserAccessControl.Details += "✓ Guest account disabled"
+        }
+    } catch { }
+    
+    $Script:CyberEssentials.UserAccessControl.Status = if ($uacIssues -eq 0) { "PASS" } elseif ($uacIssues -eq 1) { "REVIEW" } else { "FAIL" }
+    $Script:CyberEssentials.UserAccessControl.Pass = $uacIssues -eq 0
+    
+    # 4. MALWARE PROTECTION
+    $malwareIssues = 0
+    
+    try {
+        $defenderStatus = Get-MpComputerStatus -ErrorAction Stop
+        
+        if ($defenderStatus.AntivirusEnabled) {
+            $Script:CyberEssentials.MalwareProtection.Details += "✓ Windows Defender enabled"
+        } else {
+            $malwareIssues++
+            $Script:CyberEssentials.MalwareProtection.Details += "✗ Windows Defender disabled"
+        }
+        
+        if ($defenderStatus.RealTimeProtectionEnabled) {
+            $Script:CyberEssentials.MalwareProtection.Details += "✓ Real-time protection on"
+        } else {
+            $malwareIssues++
+            $Script:CyberEssentials.MalwareProtection.Details += "✗ Real-time protection off"
+        }
+        
+        if ($defenderStatus.AntivirusSignatureAge -le 1) {
+            $Script:CyberEssentials.MalwareProtection.Details += "✓ Signatures up to date"
+        } elseif ($defenderStatus.AntivirusSignatureAge -le 7) {
+            $Script:CyberEssentials.MalwareProtection.Details += "⚠ Signatures $($defenderStatus.AntivirusSignatureAge) days old"
+        } else {
+            $malwareIssues++
+            $Script:CyberEssentials.MalwareProtection.Details += "✗ Signatures $($defenderStatus.AntivirusSignatureAge) days old"
+        }
+    } catch {
+        $Script:CyberEssentials.MalwareProtection.Details += "⚠ Could not check Defender status"
+    }
+    
+    $Script:CyberEssentials.MalwareProtection.Status = if ($malwareIssues -eq 0) { "PASS" } elseif ($malwareIssues -eq 1) { "REVIEW" } else { "FAIL" }
+    $Script:CyberEssentials.MalwareProtection.Pass = $malwareIssues -eq 0
+    
+    # 5. PATCH MANAGEMENT - Windows Update status
+    $patchIssues = 0
+    
+    # Check Windows Update service
+    $wuService = Get-Service -Name "wuauserv" -ErrorAction SilentlyContinue
+    if ($wuService -and $wuService.Status -eq 'Running') {
+        $Script:CyberEssentials.PatchManagement.Details += "✓ Windows Update service running"
+    } elseif ($wuService) {
+        $patchIssues++
+        $Script:CyberEssentials.PatchManagement.Details += "✗ Windows Update service not running"
+    }
+    
+    # Check for recent updates
+    try {
+        $hotfixes = Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending
+        if ($hotfixes.Count -gt 0) {
+            $latestHotfix = $hotfixes[0]
+            $daysSinceUpdate = if ($latestHotfix.InstalledOn) { ((Get-Date) - $latestHotfix.InstalledOn).Days } else { $null }
+            
+            if ($daysSinceUpdate -and $daysSinceUpdate -le 30) {
+                $Script:CyberEssentials.PatchManagement.Details += "✓ Updated within 30 days ($($latestHotfix.HotFixID))"
+            } elseif ($daysSinceUpdate -and $daysSinceUpdate -le 60) {
+                $Script:CyberEssentials.PatchManagement.Details += "⚠ Last update $daysSinceUpdate days ago"
+            } elseif ($daysSinceUpdate) {
+                $patchIssues++
+                $Script:CyberEssentials.PatchManagement.Details += "✗ Last update $daysSinceUpdate days ago"
+            }
+        }
+    } catch {
+        $Script:CyberEssentials.PatchManagement.Details += "⚠ Could not check hotfix history"
+    }
+    
+    # Check Windows build
+    $build = [int]$Script:SystemInfo.OSBuild
+    $isWindows11 = $build -ge 22000
+    $isSupported = if ($isWindows11) { $build -ge 22621 } else { $build -ge 19044 }
+    
+    if ($isSupported) {
+        $Script:CyberEssentials.PatchManagement.Details += "✓ Windows build supported ($build)"
+    } else {
+        $patchIssues++
+        $Script:CyberEssentials.PatchManagement.Details += "✗ Windows build may be unsupported ($build)"
+    }
+    
+    $Script:CyberEssentials.PatchManagement.Status = if ($patchIssues -eq 0) { "PASS" } elseif ($patchIssues -eq 1) { "REVIEW" } else { "FAIL" }
+    $Script:CyberEssentials.PatchManagement.Pass = $patchIssues -eq 0
+    
+    # Calculate overall Cyber Essentials readiness
+    $passCount = @($Script:CyberEssentials.Values | Where-Object { $_.Pass }).Count
+    $Script:CyberEssentialsScore = [math]::Round(($passCount / 5) * 100)
+}
+
 function Test-PasswordPolicy {
     Write-AuditLog "Checking Password Policy..." -Level "INFO"
     
@@ -1153,26 +1449,75 @@ function Test-NetworkConfiguration {
     }
 }
 
-function Test-InstalledSoftware {
-    Write-AuditLog "Checking Installed Software..." -Level "INFO"
+function Get-SoftwareInventory {
+    Write-AuditLog "Building Software Inventory..." -Level "INFO"
     
-    # Get installed software from registry
-    $software = @()
+    $Script:SoftwareInventory = @()
+    
+    # Registry paths for installed software (both 32-bit and 64-bit)
     $regPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"; Architecture = "64-bit" }
+        @{ Path = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"; Architecture = "32-bit" }
+        @{ Path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"; Architecture = "User" }
     )
     
-    foreach ($path in $regPaths) {
-        $software += Get-ItemProperty $path -ErrorAction SilentlyContinue | 
-            Where-Object { $_.DisplayName } |
-            Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
+    foreach ($reg in $regPaths) {
+        try {
+            $software = Get-ItemProperty -Path $reg.Path -ErrorAction SilentlyContinue | 
+                Where-Object { $_.DisplayName -and $_.DisplayName.Trim() -ne "" }
+            
+            foreach ($app in $software) {
+                # Parse install date
+                $installDate = $null
+                if ($app.InstallDate) {
+                    try {
+                        if ($app.InstallDate -match '^\d{8}$') {
+                            $installDate = [datetime]::ParseExact($app.InstallDate, "yyyyMMdd", $null)
+                        }
+                    } catch { }
+                }
+                
+                # Calculate age in days
+                $ageDays = if ($installDate) { ((Get-Date) - $installDate).Days } else { $null }
+                
+                # Determine if Microsoft software
+                $isMicrosoft = $app.Publisher -match 'Microsoft' -or $app.DisplayName -match 'Microsoft|Windows|\.NET|Visual C\+\+'
+                
+                $Script:SoftwareInventory += [PSCustomObject]@{
+                    DisplayName     = $app.DisplayName
+                    Publisher       = $app.Publisher
+                    DisplayVersion  = $app.DisplayVersion
+                    InstallDate     = $installDate
+                    InstallDateRaw  = $app.InstallDate
+                    AgeDays         = $ageDays
+                    Architecture    = $reg.Architecture
+                    ProductCode     = $app.PSChildName
+                    UninstallString = $app.UninstallString
+                    InstallLocation = $app.InstallLocation
+                    EstimatedSizeMB = if ($app.EstimatedSize) { [math]::Round($app.EstimatedSize / 1024, 2) } else { $null }
+                    IsMicrosoft     = $isMicrosoft
+                }
+            }
+        } catch { }
     }
     
-    $software = $software | Sort-Object DisplayName -Unique
+    # Sort by DisplayName
+    $Script:SoftwareInventory = $Script:SoftwareInventory | Sort-Object DisplayName
     
-    # Check for known vulnerable/risky software patterns
+    Add-Finding -Category "Software Inventory" -Name "Installed Applications" -Risk "Info" `
+        -Description "Software inventory collected from Add/Remove Programs" `
+        -Details "Total applications: $($Script:SoftwareInventory.Count)`n64-bit: $(@($Script:SoftwareInventory | Where-Object { $_.Architecture -eq '64-bit' }).Count)`n32-bit: $(@($Script:SoftwareInventory | Where-Object { $_.Architecture -eq '32-bit' }).Count)`nUser-installed: $(@($Script:SoftwareInventory | Where-Object { $_.Architecture -eq 'User' }).Count)"
+}
+
+function Test-InstalledSoftware {
+    Write-AuditLog "Analyzing Installed Software for Risks..." -Level "INFO"
+    
+    # Ensure inventory exists
+    if (-not $Script:SoftwareInventory -or $Script:SoftwareInventory.Count -eq 0) {
+        Get-SoftwareInventory
+    }
+    
+    # Known risky/outdated software patterns
     $riskySoftware = @(
         @{ Pattern = "^Java\s+[1-8]\s+Update\s+([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-3][0-9]|24[0-9]|250)$"; Risk = "High"; Desc = "Outdated Java version with known vulnerabilities" }
         @{ Pattern = "Adobe Flash Player"; Risk = "Critical"; Desc = "Adobe Flash is end-of-life since Dec 2020 with many critical vulnerabilities" }
@@ -1186,28 +1531,52 @@ function Test-InstalledSoftware {
         @{ Pattern = "QuickTime"; Risk = "High"; Desc = "Apple QuickTime for Windows is end-of-life with known vulnerabilities" }
         @{ Pattern = "Silverlight"; Risk = "Medium"; Desc = "Microsoft Silverlight is end-of-life" }
         @{ Pattern = "Adobe Shockwave"; Risk = "Critical"; Desc = "Adobe Shockwave is end-of-life" }
+        @{ Pattern = "7-Zip\s+(1[0-8]|[0-9])\."; Risk = "Medium"; Desc = "Outdated 7-Zip version - update for security fixes" }
+        @{ Pattern = "PuTTY\s+release\s+0\.[0-7]"; Risk = "High"; Desc = "Outdated PuTTY has known vulnerabilities" }
+        @{ Pattern = "FileZilla Client\s+[0-2]\."; Risk = "Medium"; Desc = "Outdated FileZilla - update for security fixes" }
+        @{ Pattern = "Notepad\+\+\s+\([1-7]\."; Risk = "Low"; Desc = "Outdated Notepad++ - consider updating" }
     )
     
     foreach ($check in $riskySoftware) {
-        $found = $software | Where-Object { $_.DisplayName -match $check.Pattern }
+        $found = $Script:SoftwareInventory | Where-Object { $_.DisplayName -match $check.Pattern }
         foreach ($app in $found) {
             Add-Finding -Category "Software" -Name "Risky Software: $($app.DisplayName)" -Risk $check.Risk `
                 -Description $check.Desc `
-                -Details "Version: $($app.DisplayVersion), Publisher: $($app.Publisher)" `
+                -Details "Version: $($app.DisplayVersion)`nPublisher: $($app.Publisher)`nInstalled: $($app.InstallDate)" `
                 -Recommendation "Update or remove this software if not required"
         }
     }
     
     # Check for common remote access tools (informational)
-    $remoteAccessTools = @("RemotePC", "Splashtop", "ConnectWise", "ScreenConnect", "GoToMyPC", "Bomgar", "DameWare")
+    $remoteAccessTools = @("RemotePC", "Splashtop", "ConnectWise", "ScreenConnect", "GoToMyPC", "Bomgar", "DameWare", "Ammyy", "NetSupport", "Radmin")
     foreach ($tool in $remoteAccessTools) {
-        $found = $software | Where-Object { $_.DisplayName -match $tool }
-        if ($found) {
-            Add-Finding -Category "Software" -Name "Remote Access Tool: $($found.DisplayName)" -Risk "Info" `
+        $found = $Script:SoftwareInventory | Where-Object { $_.DisplayName -match $tool }
+        foreach ($app in $found) {
+            Add-Finding -Category "Software" -Name "Remote Access Tool: $($app.DisplayName)" -Risk "Info" `
                 -Description "Remote access software detected - verify if authorized" `
-                -Details "Version: $($found.DisplayVersion), Publisher: $($found.Publisher)" `
+                -Details "Version: $($app.DisplayVersion)`nPublisher: $($app.Publisher)" `
                 -Recommendation "Verify this remote access tool is authorized by security policy"
         }
+    }
+    
+    # Check for very old third-party software (installed more than 2 years ago)
+    $twoYearsAgo = (Get-Date).AddDays(-730)
+    $oldThirdParty = @($Script:SoftwareInventory | Where-Object { 
+        $_.InstallDate -and 
+        $_.InstallDate -lt $twoYearsAgo -and 
+        -not $_.IsMicrosoft
+    })
+    
+    if ($oldThirdParty.Count -gt 0) {
+        $oldList = ($oldThirdParty | Sort-Object InstallDate | Select-Object -First 15 | ForEach-Object { 
+            "$($_.DisplayName) v$($_.DisplayVersion) ($(if ($_.InstallDate) { $_.InstallDate.ToString('yyyy-MM-dd') } else { 'Unknown' }))" 
+        }) -join "`n"
+        
+        Add-Finding -Category "Software" -Name "Old Third-Party Software" -Risk "Medium" `
+            -Description "Found $($oldThirdParty.Count) third-party applications installed over 2 years ago" `
+            -Details "Old software may have unpatched vulnerabilities:`n$oldList$(if ($oldThirdParty.Count -gt 15) { "`n... and $($oldThirdParty.Count - 15) more" })" `
+            -Recommendation "Review old software for updates or removal - this is a Cyber Essentials requirement" `
+            -Reference "Cyber Essentials: Secure Configuration"
     }
 }
 
@@ -3357,6 +3726,133 @@ function New-HtmlReport {
         .toc a { color: #2d5a87; text-decoration: none; font-size: 14px; }
         .toc a:hover { text-decoration: underline; }
         
+        .cyber-essentials {
+            background: var(--bg-secondary);
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        
+        .cyber-essentials h3 {
+            font-size: 18px;
+            margin-bottom: 16px;
+            color: #1e3a5f;
+        }
+        
+        .ce-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 16px;
+        }
+        
+        .ce-item {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 16px;
+            border-left: 4px solid var(--info);
+        }
+        
+        .ce-item.pass { border-left-color: #28a745; background: #f0fff4; }
+        .ce-item.fail { border-left-color: #dc3545; background: #fff5f5; }
+        .ce-item.review { border-left-color: #ffc107; background: #fffdf0; }
+        
+        .ce-item h4 {
+            font-size: 14px;
+            margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .ce-status {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        
+        .ce-status.pass { background: #28a745; color: white; }
+        .ce-status.fail { background: #dc3545; color: white; }
+        .ce-status.review { background: #ffc107; color: #212529; }
+        .ce-status.unknown { background: #6c757d; color: white; }
+        
+        .ce-details {
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+        
+        .ce-details div { margin: 2px 0; }
+        
+        .software-inventory {
+            background: var(--bg-secondary);
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        
+        .software-inventory h3 {
+            font-size: 18px;
+            margin-bottom: 16px;
+            color: #1e3a5f;
+        }
+        
+        .inventory-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        
+        .inventory-table th {
+            background: #1e3a5f;
+            color: white;
+            padding: 10px 8px;
+            text-align: left;
+            position: sticky;
+            top: 0;
+        }
+        
+        .inventory-table td {
+            padding: 8px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .inventory-table tr:hover { background: #f8f9fa; }
+        
+        .inventory-table tr.old-software { background: #fff5f5; }
+        
+        .inventory-wrapper {
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+        }
+        
+        .inventory-filter {
+            margin-bottom: 12px;
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        
+        .inventory-filter input {
+            padding: 8px 12px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 13px;
+            flex: 1;
+            min-width: 200px;
+        }
+        
+        .inventory-filter select {
+            padding: 8px 12px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            font-size: 13px;
+        }
+        
         .footer {
             text-align: center;
             padding: 20px;
@@ -3488,6 +3984,54 @@ function New-HtmlReport {
             </div>
         </div>
         
+"@
+
+    # Add Cyber Essentials Summary Section
+    $ceFirewallClass = switch ($Script:CyberEssentials.Firewalls.Status) { "PASS" { "pass" } "FAIL" { "fail" } default { "review" } }
+    $ceSecConfigClass = switch ($Script:CyberEssentials.SecureConfiguration.Status) { "PASS" { "pass" } "FAIL" { "fail" } default { "review" } }
+    $ceUserAccessClass = switch ($Script:CyberEssentials.UserAccessControl.Status) { "PASS" { "pass" } "FAIL" { "fail" } default { "review" } }
+    $ceMalwareClass = switch ($Script:CyberEssentials.MalwareProtection.Status) { "PASS" { "pass" } "FAIL" { "fail" } default { "review" } }
+    $cePatchClass = switch ($Script:CyberEssentials.PatchManagement.Status) { "PASS" { "pass" } "FAIL" { "fail" } default { "review" } }
+    
+    $ceScoreColor = if ($Script:CyberEssentialsScore -ge 80) { "#28a745" } elseif ($Script:CyberEssentialsScore -ge 60) { "#ffc107" } else { "#dc3545" }
+    
+    $html += @"
+        <div class="cyber-essentials">
+            <h3>🔐 Cyber Essentials Assessment Summary <span style="float: right; font-size: 14px; color: $ceScoreColor;">Readiness Score: $($Script:CyberEssentialsScore)%</span></h3>
+            <div class="ce-grid">
+                <div class="ce-item $ceFirewallClass">
+                    <h4>🛡️ Firewalls <span class="ce-status $ceFirewallClass">$($Script:CyberEssentials.Firewalls.Status)</span></h4>
+                    <div class="ce-details">
+                        $($Script:CyberEssentials.Firewalls.Details | ForEach-Object { "<div>$_</div>" })
+                    </div>
+                </div>
+                <div class="ce-item $ceSecConfigClass">
+                    <h4>⚙️ Secure Configuration <span class="ce-status $ceSecConfigClass">$($Script:CyberEssentials.SecureConfiguration.Status)</span></h4>
+                    <div class="ce-details">
+                        $($Script:CyberEssentials.SecureConfiguration.Details | ForEach-Object { "<div>$_</div>" })
+                    </div>
+                </div>
+                <div class="ce-item $ceUserAccessClass">
+                    <h4>👤 User Access Control <span class="ce-status $ceUserAccessClass">$($Script:CyberEssentials.UserAccessControl.Status)</span></h4>
+                    <div class="ce-details">
+                        $($Script:CyberEssentials.UserAccessControl.Details | ForEach-Object { "<div>$_</div>" })
+                    </div>
+                </div>
+                <div class="ce-item $ceMalwareClass">
+                    <h4>🦠 Malware Protection <span class="ce-status $ceMalwareClass">$($Script:CyberEssentials.MalwareProtection.Status)</span></h4>
+                    <div class="ce-details">
+                        $($Script:CyberEssentials.MalwareProtection.Details | ForEach-Object { "<div>$_</div>" })
+                    </div>
+                </div>
+                <div class="ce-item $cePatchClass">
+                    <h4>🔄 Patch Management <span class="ce-status $cePatchClass">$($Script:CyberEssentials.PatchManagement.Status)</span></h4>
+                    <div class="ce-details">
+                        $($Script:CyberEssentials.PatchManagement.Details | ForEach-Object { "<div>$_</div>" })
+                    </div>
+                </div>
+            </div>
+        </div>
+        
         <div class="toc">
             <h3>📋 Table of Contents</h3>
             <ul>
@@ -3498,6 +4042,11 @@ function New-HtmlReport {
     foreach ($cat in $categories) {
         $catId = $cat -replace '\s+', '-' -replace '[^\w-]', ''
         $html += "                <li><a href='#$catId'>$cat</a></li>`n"
+    }
+    
+    # Add Software Inventory link if inventory exists
+    if ($Script:SoftwareInventory -and $Script:SoftwareInventory.Count -gt 0) {
+        $html += "                <li><a href='#software-inventory'>📦 Software Inventory ($($Script:SoftwareInventory.Count))</a></li>`n"
     }
     
     $adminStatusHtml = if ($Script:SystemInfo.IsAdmin) {
@@ -3525,6 +4074,97 @@ function New-HtmlReport {
             </div>
         </div>
 "@
+
+    # Add Software Inventory Section
+    if ($Script:SoftwareInventory -and $Script:SoftwareInventory.Count -gt 0) {
+        $twoYearsAgo = (Get-Date).AddDays(-730)
+        
+        $html += @"
+        
+        <div class="software-inventory" id="software-inventory">
+            <h3>📦 Software Inventory ($($Script:SoftwareInventory.Count) applications)</h3>
+            <div class="inventory-filter">
+                <input type="text" id="softwareSearch" placeholder="Search software..." onkeyup="filterSoftware()">
+                <select id="archFilter" onchange="filterSoftware()">
+                    <option value="">All Architectures</option>
+                    <option value="64-bit">64-bit</option>
+                    <option value="32-bit">32-bit</option>
+                    <option value="User">User-installed</option>
+                </select>
+                <select id="ageFilter" onchange="filterSoftware()">
+                    <option value="">All Ages</option>
+                    <option value="old">Older than 2 years</option>
+                    <option value="recent">Last 2 years</option>
+                </select>
+            </div>
+            <div class="inventory-wrapper">
+                <table class="inventory-table" id="inventoryTable">
+                    <thead>
+                        <tr>
+                            <th>Application Name</th>
+                            <th>Publisher</th>
+                            <th>Version</th>
+                            <th>Install Date</th>
+                            <th>Arch</th>
+                            <th>Size (MB)</th>
+                            <th>Product Code</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+        
+        foreach ($app in $Script:SoftwareInventory) {
+            $isOld = $app.InstallDate -and $app.InstallDate -lt $twoYearsAgo -and -not $app.IsMicrosoft
+            $rowClass = if ($isOld) { "old-software" } else { "" }
+            $installDateStr = if ($app.InstallDate) { $app.InstallDate.ToString("yyyy-MM-dd") } else { $app.InstallDateRaw }
+            $sizeStr = if ($app.EstimatedSizeMB) { $app.EstimatedSizeMB.ToString() } else { "" }
+            
+            $html += @"
+                        <tr class="$rowClass" data-arch="$($app.Architecture)" data-old="$isOld">
+                            <td>$(ConvertTo-HtmlSafe $app.DisplayName)</td>
+                            <td>$(ConvertTo-HtmlSafe $app.Publisher)</td>
+                            <td>$(ConvertTo-HtmlSafe $app.DisplayVersion)</td>
+                            <td>$installDateStr</td>
+                            <td>$($app.Architecture)</td>
+                            <td>$sizeStr</td>
+                            <td style="font-size: 10px;">$(ConvertTo-HtmlSafe $app.ProductCode)</td>
+                        </tr>
+"@
+        }
+        
+        $html += @"
+                    </tbody>
+                </table>
+            </div>
+            <p style="font-size: 11px; color: var(--text-secondary); margin-top: 8px;">
+                <span style="background: #fff5f5; padding: 2px 6px; border-radius: 3px;">Highlighted rows</span> = Third-party software installed over 2 years ago (review for updates)
+            </p>
+        </div>
+        
+        <script>
+        function filterSoftware() {
+            var searchText = document.getElementById('softwareSearch').value.toLowerCase();
+            var archFilter = document.getElementById('archFilter').value;
+            var ageFilter = document.getElementById('ageFilter').value;
+            var rows = document.querySelectorAll('#inventoryTable tbody tr');
+            
+            rows.forEach(function(row) {
+                var text = row.textContent.toLowerCase();
+                var arch = row.getAttribute('data-arch');
+                var isOld = row.getAttribute('data-old') === 'True';
+                
+                var matchesSearch = text.includes(searchText);
+                var matchesArch = !archFilter || arch === archFilter;
+                var matchesAge = !ageFilter || 
+                    (ageFilter === 'old' && isOld) || 
+                    (ageFilter === 'recent' && !isOld);
+                
+                row.style.display = (matchesSearch && matchesArch && matchesAge) ? '' : 'none';
+            });
+        }
+        </script>
+"@
+    }
     
     # Add findings by category
     foreach ($cat in $categories) {
@@ -3616,6 +4256,8 @@ function Start-SecurityAudit {
     # Run all audit modules
     $modules = @(
         { Get-SystemInformation },
+        { Test-MDMEnrollment },
+        { Get-SoftwareInventory },
         { Test-PasswordPolicy },
         { Test-UserAccounts },
         { Test-AuditPolicy },
@@ -3666,6 +4308,9 @@ function Start-SecurityAudit {
             Write-AuditLog "Module failed: $_" -Level "ERROR"
         }
     }
+    
+    # Generate Cyber Essentials Summary after all modules have run
+    Get-CyberEssentialsSummary
     
     # Generate report
     $html = New-HtmlReport
