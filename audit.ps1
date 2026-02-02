@@ -443,7 +443,7 @@ function Get-CyberEssentialsSummary {
     if ($Script:SoftwareInventory) {
         $twoYearsAgo = (Get-Date).AddDays(-730)
         $oldThirdParty = @($Script:SoftwareInventory | Where-Object { 
-            $_.InstallDate -and $_.InstallDate -lt $twoYearsAgo -and -not $_.IsMicrosoft
+            $_.InstallDate -and $_.InstallDate -lt $twoYearsAgo -and -not $_.IsSystemVendor
         })
         if ($oldThirdParty.Count -gt 10) {
             $secConfigIssues++
@@ -1480,8 +1480,49 @@ function Get-SoftwareInventory {
                 # Calculate age in days
                 $ageDays = if ($installDate) { ((Get-Date) - $installDate).Days } else { $null }
                 
-                # Determine if Microsoft software
-                $isMicrosoft = $app.Publisher -match 'Microsoft' -or $app.DisplayName -match 'Microsoft|Windows|\.NET|Visual C\+\+'
+                # Determine if system/OEM software (not third-party)
+                # These are vendors whose software typically comes pre-installed or is system-level
+                $isSystemVendor = $false
+                
+                $systemVendors = @(
+                    # Microsoft
+                    'Microsoft', 'Windows', 'Visual C++', 'Visual Studio', 'SQL Server', 
+                    'Azure', 'OneDrive', 'Xbox', 'Skype', '.NET', 'MSVC',
+                    # PC OEMs
+                    'Dell', 'Hewlett-Packard', 'Hewlett Packard', 'HP Inc', 'HP Development',
+                    'Lenovo', 'Lenovo Group',
+                    'ASUS', 'ASUSTeK', 'Acer', 'Samsung', 'Toshiba', 'Sony', 'Fujitsu', 
+                    'Panasonic', 'MSI', 'Micro-Star', 'Gigabyte', 'Razer Inc',
+                    # Hardware/Chip vendors
+                    'Intel', 'AMD', 'Advanced Micro Devices', 'NVIDIA', 
+                    'Realtek', 'Qualcomm', 'Broadcom', 'Marvell', 'MediaTek',
+                    'Synaptics', 'ELAN', 'Conexant', 'IDT', 'Cirrus Logic',
+                    'Texas Instruments', 'Analog Devices',
+                    # Audio
+                    'Dolby', 'Waves Audio', 'Creative Technology', 'Bang & Olufsen',
+                    # Peripherals
+                    'DisplayLink', 'Logitech', 'Corsair', 'SteelSeries',
+                    # Virtualization
+                    'VMware', 'Citrix', 'Parallels', 'Oracle VM',
+                    # Apple
+                    'Apple Inc', 'Apple Computer'
+                )
+                
+                if ($app.Publisher) {
+                    foreach ($vendor in $systemVendors) {
+                        if ($app.Publisher -like "*$vendor*") {
+                            $isSystemVendor = $true
+                            break
+                        }
+                    }
+                }
+                
+                # Also check display name for Microsoft products that may have different publishers
+                if (-not $isSystemVendor -and $app.DisplayName) {
+                    if ($app.DisplayName -match '^(Microsoft |Windows |Intel |NVIDIA |AMD |Realtek |Dell |HP |Lenovo )') {
+                        $isSystemVendor = $true
+                    }
+                }
                 
                 $Script:SoftwareInventory += [PSCustomObject]@{
                     DisplayName     = $app.DisplayName
@@ -1495,7 +1536,7 @@ function Get-SoftwareInventory {
                     UninstallString = $app.UninstallString
                     InstallLocation = $app.InstallLocation
                     EstimatedSizeMB = if ($app.EstimatedSize) { [math]::Round($app.EstimatedSize / 1024, 2) } else { $null }
-                    IsMicrosoft     = $isMicrosoft
+                    IsSystemVendor  = $isSystemVendor
                 }
             }
         } catch { }
@@ -1564,7 +1605,7 @@ function Test-InstalledSoftware {
     $oldThirdParty = @($Script:SoftwareInventory | Where-Object { 
         $_.InstallDate -and 
         $_.InstallDate -lt $twoYearsAgo -and 
-        -not $_.IsMicrosoft
+        -not $_.IsSystemVendor
     })
     
     if ($oldThirdParty.Count -gt 0) {
@@ -4114,7 +4155,7 @@ function New-HtmlReport {
 "@
         
         foreach ($app in $Script:SoftwareInventory) {
-            $isOld = $app.InstallDate -and $app.InstallDate -lt $twoYearsAgo -and -not $app.IsMicrosoft
+            $isOld = $app.InstallDate -and $app.InstallDate -lt $twoYearsAgo -and -not $app.IsSystemVendor
             $rowClass = if ($isOld) { "old-software" } else { "" }
             $installDateStr = if ($app.InstallDate) { $app.InstallDate.ToString("yyyy-MM-dd") } else { $app.InstallDateRaw }
             $sizeStr = if ($app.EstimatedSizeMB) { $app.EstimatedSizeMB.ToString() } else { "" }
