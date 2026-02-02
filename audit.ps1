@@ -529,16 +529,51 @@ function Get-CyberEssentialsSummary {
     $Script:CyberEssentials.MalwareProtection.Status = if ($malwareIssues -eq 0) { "PASS" } elseif ($malwareIssues -eq 1) { "REVIEW" } else { "FAIL" }
     $Script:CyberEssentials.MalwareProtection.Pass = $malwareIssues -eq 0
     
-    # 5. PATCH MANAGEMENT - Windows Update status
+    # 5. PATCH MANAGEMENT - Windows Update configuration and status
     $patchIssues = 0
     
-    # Check Windows Update service
+    # Check Windows Update service - Disabled is bad, Manual is normal/expected
     $wuService = Get-Service -Name "wuauserv" -ErrorAction SilentlyContinue
-    if ($wuService -and $wuService.Status -eq 'Running') {
-        $Script:CyberEssentials.PatchManagement.Details += "✓ Windows Update service running"
-    } elseif ($wuService) {
+    if ($wuService -and $wuService.StartType -eq 'Disabled') {
         $patchIssues++
-        $Script:CyberEssentials.PatchManagement.Details += "✗ Windows Update service not running"
+        $Script:CyberEssentials.PatchManagement.Details += "✗ Windows Update service disabled"
+    } else {
+        $Script:CyberEssentials.PatchManagement.Details += "✓ Windows Update service enabled"
+    }
+    
+    # Check if automatic updates are configured
+    $auPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+    $noAutoUpdate = Get-RegistryValue -Path $auPath -Name "NoAutoUpdate" -Default 0
+    $auOptions = Get-RegistryValue -Path $auPath -Name "AUOptions" -Default $null
+    
+    if ($noAutoUpdate -eq 1 -or $auOptions -eq 1) {
+        $patchIssues++
+        $Script:CyberEssentials.PatchManagement.Details += "✗ Automatic updates disabled"
+    } elseif ($auOptions -eq 4) {
+        $Script:CyberEssentials.PatchManagement.Details += "✓ Auto-install updates enabled"
+    } elseif ($auOptions -in @(2, 3)) {
+        $Script:CyberEssentials.PatchManagement.Details += "⚠ Updates require manual install"
+    } else {
+        $Script:CyberEssentials.PatchManagement.Details += "✓ Using Windows default updates"
+    }
+    
+    # Check WSUS configuration for security issues
+    $wuPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+    $wsusServer = Get-RegistryValue -Path $wuPath -Name "WUServer" -Default $null
+    $useWUServer = Get-RegistryValue -Path $auPath -Name "UseWUServer" -Default 0
+    
+    if ($wsusServer -and $useWUServer -eq 1) {
+        if ($wsusServer -match '^http://') {
+            $patchIssues++
+            $Script:CyberEssentials.PatchManagement.Details += "✗ WSUS uses HTTP (insecure)"
+        } else {
+            $Script:CyberEssentials.PatchManagement.Details += "✓ WSUS uses HTTPS"
+        }
+        
+        $serverName = $wsusServer -replace '^https?://' -replace '/.*$' -replace ':\d+$'
+        if ($serverName -notmatch '\.') {
+            $Script:CyberEssentials.PatchManagement.Details += "⚠ WSUS uses NetBIOS name"
+        }
     }
     
     # Check for recent updates
@@ -549,7 +584,7 @@ function Get-CyberEssentialsSummary {
             $daysSinceUpdate = if ($latestHotfix.InstalledOn) { ((Get-Date) - $latestHotfix.InstalledOn).Days } else { $null }
             
             if ($daysSinceUpdate -and $daysSinceUpdate -le 30) {
-                $Script:CyberEssentials.PatchManagement.Details += "✓ Updated within 30 days ($($latestHotfix.HotFixID))"
+                $Script:CyberEssentials.PatchManagement.Details += "✓ Updated within 30 days"
             } elseif ($daysSinceUpdate -and $daysSinceUpdate -le 60) {
                 $Script:CyberEssentials.PatchManagement.Details += "⚠ Last update $daysSinceUpdate days ago"
             } elseif ($daysSinceUpdate) {
@@ -1684,7 +1719,7 @@ function Test-ScheduledTasks {
 }
 
 function Test-UpdateStatus {
-    Write-AuditLog "Checking Windows Update Status..." -Level "INFO"
+    Write-AuditLog "Checking Windows Update Configuration..." -Level "INFO"
     
     try {
         # Check last update time via registry
@@ -1701,13 +1736,13 @@ function Test-UpdateStatus {
                         -Description "Windows has not been updated in over 90 days" `
                         -Details "Last update: $lastUpdateDate ($daysSinceUpdate days ago)" `
                         -Recommendation "Apply Windows updates immediately" `
-                        -Reference "Patch Management Policy"
+                        -Reference "Cyber Essentials: Patch Management"
                 } elseif ($daysSinceUpdate -gt 30) {
                     Add-Finding -Category "Updates" -Name "Outdated Updates" -Risk "High" `
                         -Description "Windows has not been updated in over 30 days" `
                         -Details "Last update: $lastUpdateDate ($daysSinceUpdate days ago)" `
                         -Recommendation "Apply Windows updates" `
-                        -Reference "Patch Management Policy"
+                        -Reference "Cyber Essentials: Patch Management"
                 } else {
                     Add-Finding -Category "Updates" -Name "Update Status" -Risk "Info" `
                         -Description "Windows updates are relatively current" `
@@ -1718,22 +1753,154 @@ function Test-UpdateStatus {
             }
         }
         
-        # Check Windows Update service
+        # Check Windows Update service - note: Manual start type is normal/expected
         $wuService = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
         if ($wuService.StartType -eq 'Disabled') {
             Add-Finding -Category "Updates" -Name "Windows Update Service Disabled" -Risk "High" `
                 -Description "The Windows Update service is disabled" `
                 -Details "Service Status: $($wuService.Status), StartType: $($wuService.StartType)" `
-                -Recommendation "Enable Windows Update service for security patches"
+                -Recommendation "Set Windows Update service to Manual (default) or Automatic"
         }
         
-        # Check for WSUS configuration (if managed)
-        $wsusServer = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Name "WUServer"
-        if ($wsusServer) {
-            Add-Finding -Category "Updates" -Name "WSUS Configured" -Risk "Info" `
-                -Description "System is configured to use WSUS for updates" `
-                -Details "WSUS Server: $wsusServer" `
-                -Recommendation "Ensure WSUS server is properly maintained"
+        # Check Automatic Update Configuration
+        $auPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+        $noAutoUpdate = Get-RegistryValue -Path $auPath -Name "NoAutoUpdate" -Default 0
+        $auOptions = Get-RegistryValue -Path $auPath -Name "AUOptions" -Default $null
+        $scheduledDay = Get-RegistryValue -Path $auPath -Name "ScheduledInstallDay" -Default $null
+        $scheduledTime = Get-RegistryValue -Path $auPath -Name "ScheduledInstallTime" -Default $null
+        $useWUServer = Get-RegistryValue -Path $auPath -Name "UseWUServer" -Default 0
+        
+        # Also check non-GPO settings
+        $auPathLocal = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
+        $auOptionsLocal = Get-RegistryValue -Path $auPathLocal -Name "AUOptions" -Default $null
+        
+        # Determine effective AU setting
+        $effectiveAUOption = if ($auOptions) { $auOptions } else { $auOptionsLocal }
+        
+        $auOptionDesc = switch ($effectiveAUOption) {
+            1 { "Disabled (Keep me updated is off)" }
+            2 { "Notify for download and notify for install" }
+            3 { "Auto download and notify for install" }
+            4 { "Auto download and schedule install" }
+            5 { "Allow local admin to choose setting" }
+            default { "Not configured (Windows default)" }
+        }
+        
+        if ($noAutoUpdate -eq 1) {
+            Add-Finding -Category "Updates" -Name "Automatic Updates Disabled" -Risk "High" `
+                -Description "Automatic Windows Updates are disabled via policy" `
+                -Details "NoAutoUpdate: 1`nThis prevents automatic security patches" `
+                -Recommendation "Enable automatic updates for timely security patching" `
+                -Reference "Cyber Essentials: Patch Management"
+        } elseif ($effectiveAUOption -eq 1) {
+            Add-Finding -Category "Updates" -Name "Automatic Updates Disabled" -Risk "High" `
+                -Description "Automatic Windows Updates are disabled" `
+                -Details "AUOptions: 1 (Keep me updated is off)" `
+                -Recommendation "Enable automatic updates for security patches" `
+                -Reference "Cyber Essentials: Patch Management"
+        } elseif ($effectiveAUOption -in @(2, 3)) {
+            Add-Finding -Category "Updates" -Name "Updates Require Manual Install" -Risk "Medium" `
+                -Description "Updates download but require manual installation" `
+                -Details "AUOptions: $effectiveAUOption ($auOptionDesc)" `
+                -Recommendation "Consider enabling automatic installation of updates"
+        } elseif ($effectiveAUOption -eq 4) {
+            $dayName = switch ($scheduledDay) {
+                0 { "Every day" }
+                1 { "Sunday" }
+                2 { "Monday" }
+                3 { "Tuesday" }
+                4 { "Wednesday" }
+                5 { "Thursday" }
+                6 { "Friday" }
+                7 { "Saturday" }
+                default { "Not specified" }
+            }
+            $timeStr = if ($scheduledTime -ne $null) { "${scheduledTime}:00" } else { "Not specified" }
+            
+            Add-Finding -Category "Updates" -Name "Automatic Updates Configured" -Risk "Info" `
+                -Description "Updates are configured to install automatically on a schedule" `
+                -Details "AUOptions: $effectiveAUOption ($auOptionDesc)`nSchedule: $dayName at $timeStr"
+        } else {
+            Add-Finding -Category "Updates" -Name "Automatic Update Setting" -Risk "Info" `
+                -Description "Automatic update configuration" `
+                -Details "AUOptions: $effectiveAUOption ($auOptionDesc)"
+        }
+        
+        # Check for WSUS configuration
+        $wuPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+        $wsusServer = Get-RegistryValue -Path $wuPath -Name "WUServer" -Default $null
+        $wsusStatusServer = Get-RegistryValue -Path $wuPath -Name "WUStatusServer" -Default $null
+        $doNotConnectToWU = Get-RegistryValue -Path $wuPath -Name "DoNotConnectToWindowsUpdateInternetLocations" -Default 0
+        
+        if ($wsusServer -and $useWUServer -eq 1) {
+            $wsusIssues = @()
+            
+            # Check if WSUS uses HTTP (insecure) vs HTTPS
+            if ($wsusServer -match '^http://') {
+                $wsusIssues += "Uses HTTP (unencrypted) - vulnerable to MITM attacks"
+                Add-Finding -Category "Updates" -Name "WSUS Using HTTP" -Risk "High" `
+                    -Description "WSUS server is configured to use unencrypted HTTP" `
+                    -Details "WSUS Server: $wsusServer`nHTTP connections are vulnerable to man-in-the-middle attacks (WSUSpect)" `
+                    -Recommendation "Configure WSUS to use HTTPS for secure update delivery" `
+                    -Reference "CVE-2020-1013 - WSUS MITM"
+            } elseif ($wsusServer -match '^https://') {
+                Add-Finding -Category "Updates" -Name "WSUS Using HTTPS" -Risk "Info" `
+                    -Description "WSUS server is configured to use encrypted HTTPS" `
+                    -Details "WSUS Server: $wsusServer"
+            }
+            
+            # Check if WSUS server name is NetBIOS (no dots) vs FQDN
+            $serverName = $wsusServer -replace '^https?://' -replace '/.*$' -replace ':\d+$'
+            
+            if ($serverName -notmatch '\.') {
+                Add-Finding -Category "Updates" -Name "WSUS Using NetBIOS Name" -Risk "Medium" `
+                    -Description "WSUS server is configured with a NetBIOS name instead of FQDN" `
+                    -Details "Server: $serverName`nNetBIOS names are vulnerable to name resolution poisoning (LLMNR/NBT-NS)" `
+                    -Recommendation "Use a fully qualified domain name (FQDN) for the WSUS server" `
+                    -Reference "Security Best Practice"
+            } else {
+                Add-Finding -Category "Updates" -Name "WSUS Server Configuration" -Risk "Info" `
+                    -Description "WSUS is configured with FQDN" `
+                    -Details "Server: $serverName"
+            }
+            
+            # Check if system is blocked from Windows Update
+            if ($doNotConnectToWU -eq 1) {
+                Add-Finding -Category "Updates" -Name "Windows Update Internet Blocked" -Risk "Info" `
+                    -Description "System is configured to only receive updates from WSUS" `
+                    -Details "DoNotConnectToWindowsUpdateInternetLocations: 1`nDevice cannot fall back to Microsoft Update if WSUS unavailable"
+            }
+            
+            # WSUS status server
+            if ($wsusStatusServer -and $wsusStatusServer -ne $wsusServer) {
+                Add-Finding -Category "Updates" -Name "WSUS Status Server" -Risk "Info" `
+                    -Description "Separate WSUS status server is configured" `
+                    -Details "Status Server: $wsusStatusServer"
+            }
+        } elseif ($wsusServer) {
+            Add-Finding -Category "Updates" -Name "WSUS Configured But Not Used" -Risk "Info" `
+                -Description "WSUS server is defined but UseWUServer is not enabled" `
+                -Details "WSUS Server: $wsusServer`nUseWUServer: $useWUServer"
+        }
+        
+        # Check for Windows Update for Business / Delivery Optimization
+        $wufbPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+        $deferFeature = Get-RegistryValue -Path $wufbPath -Name "DeferFeatureUpdates" -Default $null
+        $deferQuality = Get-RegistryValue -Path $wufbPath -Name "DeferQualityUpdates" -Default $null
+        $deferFeatureDays = Get-RegistryValue -Path $wufbPath -Name "DeferFeatureUpdatesPeriodInDays" -Default $null
+        $deferQualityDays = Get-RegistryValue -Path $wufbPath -Name "DeferQualityUpdatesPeriodInDays" -Default $null
+        
+        if ($deferFeatureDays -or $deferQualityDays) {
+            $deferDetails = ""
+            if ($deferFeatureDays) { $deferDetails += "Feature updates deferred: $deferFeatureDays days`n" }
+            if ($deferQualityDays) { $deferDetails += "Quality updates deferred: $deferQualityDays days" }
+            
+            $risk = if ($deferQualityDays -gt 14) { "Medium" } else { "Info" }
+            
+            Add-Finding -Category "Updates" -Name "Update Deferral Configured" -Risk $risk `
+                -Description "Windows Update for Business deferral is configured" `
+                -Details $deferDetails.Trim() `
+                -Recommendation "Ensure security updates are not deferred excessively (max 14 days recommended)"
         }
         
     } catch {
@@ -2090,15 +2257,7 @@ function Test-PrivilegeEscalation {
         }
     }
     
-    # Check for WSUS HTTP (non-HTTPS) - can be used for privilege escalation
-    $wsusServer = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Name "WUServer" -Default $null
-    if ($wsusServer -and $wsusServer -match '^http://') {
-        Add-Finding -Category "Privilege Escalation" -Name "WSUS Using HTTP" -Risk "High" `
-            -Description "WSUS is configured to use HTTP instead of HTTPS - vulnerable to MITM attacks" `
-            -Details "WSUS Server: $wsusServer" `
-            -Recommendation "Configure WSUS to use HTTPS" `
-            -Reference "WSUSpect Attack"
-    }
+    # Note: WSUS HTTP vulnerability is checked in Test-UpdateStatus
 }
 
 function Test-SecureBoot {
