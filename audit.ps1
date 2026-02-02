@@ -246,6 +246,15 @@ function Get-SystemInformation {
         -Description "Basic system information collected" `
         -Details "OS: $($Script:SystemInfo.OSName) | Build: $($Script:SystemInfo.OSBuild) | Arch: $($Script:SystemInfo.Architecture)"
     
+    # CRITICAL: Warn if not running as admin
+    if (-not $Script:SystemInfo.IsAdmin) {
+        Add-Finding -Category "System Info" -Name "⛔ SCAN RUN WITHOUT ADMIN RIGHTS" -Risk "Critical" `
+            -Description "This audit was NOT run with administrative privileges - RESULTS ARE INCOMPLETE" `
+            -Details "Many security checks require admin rights to access protected settings, registry keys, and system configuration. The findings in this report do not represent the complete security posture of this system.`n`nAffected areas include: Security policies, BitLocker, Credential Guard, LSA protection, Windows Defender configuration, audit policies, user rights, driver signing, and many others." `
+            -Recommendation "RE-RUN THIS AUDIT FROM AN ELEVATED POWERSHELL PROMPT (Run as Administrator) to get complete and accurate results." `
+            -Reference "Administrative privileges required for full security audit"
+    }
+    
     # Check Windows version/build for support status
     # Windows 10: 19041 (2004), 19042 (20H2), 19043 (21H1), 19044 (21H2), 19045 (22H2)
     # Windows 11: 22000 (21H2), 22621 (22H2), 22631 (23H2)
@@ -2442,6 +2451,621 @@ function Test-OfficeSecurity {
     }
 }
 
+function Test-ExploitProtection {
+    Write-AuditLog "Checking Windows Exploit Protection Settings..." -Level "INFO"
+    
+    try {
+        $processSettings = Get-ProcessMitigation -System -ErrorAction Stop
+        
+        # Check DEP (Data Execution Prevention)
+        if ($processSettings.DEP.Enable -eq "OFF") {
+            Add-Finding -Category "Exploit Protection" -Name "DEP Disabled" -Risk "High" `
+                -Description "Data Execution Prevention is disabled system-wide" `
+                -Details "DEP: OFF" `
+                -Recommendation "Enable DEP: Set-ProcessMitigation -System -Enable DEP" `
+                -Reference "CIS Benchmark"
+        } else {
+            Add-Finding -Category "Exploit Protection" -Name "DEP Enabled" -Risk "Info" `
+                -Description "Data Execution Prevention is enabled" `
+                -Details "DEP: $($processSettings.DEP.Enable)"
+        }
+        
+        # Check ASLR (Address Space Layout Randomization)
+        if ($processSettings.ASLR.BottomUp -eq "OFF" -and $processSettings.ASLR.HighEntropy -eq "OFF") {
+            Add-Finding -Category "Exploit Protection" -Name "ASLR Disabled" -Risk "High" `
+                -Description "Address Space Layout Randomization is disabled" `
+                -Details "BottomUp: $($processSettings.ASLR.BottomUp), HighEntropy: $($processSettings.ASLR.HighEntropy)" `
+                -Recommendation "Enable ASLR for exploit mitigation" `
+                -Reference "Windows Security Baseline"
+        } elseif ($processSettings.ASLR.HighEntropy -eq "OFF") {
+            Add-Finding -Category "Exploit Protection" -Name "High Entropy ASLR Disabled" -Risk "Medium" `
+                -Description "High Entropy ASLR is not enabled" `
+                -Details "HighEntropy: OFF" `
+                -Recommendation "Enable High Entropy ASLR for better protection"
+        } else {
+            Add-Finding -Category "Exploit Protection" -Name "ASLR Enabled" -Risk "Info" `
+                -Description "ASLR is enabled" `
+                -Details "BottomUp: $($processSettings.ASLR.BottomUp), HighEntropy: $($processSettings.ASLR.HighEntropy)"
+        }
+        
+        # Check CFG (Control Flow Guard)
+        if ($processSettings.CFG.Enable -eq "OFF") {
+            Add-Finding -Category "Exploit Protection" -Name "CFG Disabled" -Risk "Medium" `
+                -Description "Control Flow Guard is disabled system-wide" `
+                -Details "CFG: OFF" `
+                -Recommendation "Enable CFG for control flow integrity protection"
+        }
+        
+        # Check SEHOP
+        if ($processSettings.SEHOP.Enable -eq "OFF") {
+            Add-Finding -Category "Exploit Protection" -Name "SEHOP Disabled" -Risk "Medium" `
+                -Description "SEHOP is disabled" `
+                -Details "SEHOP: OFF" `
+                -Recommendation "Enable SEHOP for SEH overwrite protection"
+        }
+        
+    } catch {
+        Add-Finding -Category "Exploit Protection" -Name "Exploit Protection Check Failed" -Risk "Info" `
+            -Description "Could not check exploit protection settings" `
+            -Details "Error: $_. May require Windows 10 1709+ or admin privileges."
+    }
+}
+
+function Test-PowerShellSecurity {
+    Write-AuditLog "Checking PowerShell Security Configuration..." -Level "INFO"
+    
+    # Check PowerShell execution policy
+    try {
+        $execPolicy = Get-ExecutionPolicy -List -ErrorAction Stop
+        $machinePolicy = ($execPolicy | Where-Object { $_.Scope -eq 'MachinePolicy' }).ExecutionPolicy
+        $userPolicy = ($execPolicy | Where-Object { $_.Scope -eq 'UserPolicy' }).ExecutionPolicy
+        $effectivePolicy = Get-ExecutionPolicy
+        
+        if ($effectivePolicy -eq 'Unrestricted' -or $effectivePolicy -eq 'Bypass') {
+            Add-Finding -Category "PowerShell Security" -Name "Weak Execution Policy" -Risk "Medium" `
+                -Description "PowerShell execution policy is set to $effectivePolicy" `
+                -Details "Effective: $effectivePolicy, Machine: $machinePolicy, User: $userPolicy" `
+                -Recommendation "Set execution policy to RemoteSigned or AllSigned" `
+                -Reference "Security Best Practice"
+        } else {
+            Add-Finding -Category "PowerShell Security" -Name "Execution Policy" -Risk "Info" `
+                -Description "PowerShell execution policy is configured" `
+                -Details "Effective: $effectivePolicy"
+        }
+    } catch { }
+    
+    # Check Constrained Language Mode
+    $clm = $ExecutionContext.SessionState.LanguageMode
+    if ($clm -eq 'ConstrainedLanguage') {
+        Add-Finding -Category "PowerShell Security" -Name "Constrained Language Mode Active" -Risk "Info" `
+            -Description "PowerShell is running in Constrained Language Mode" `
+            -Details "LanguageMode: $clm"
+    }
+    
+    # Check PowerShell transcription
+    $transcription = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription" -Name "EnableTranscripting" -Default 0
+    $transcriptDir = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription" -Name "OutputDirectory" -Default ""
+    
+    if ($transcription -eq 1) {
+        Add-Finding -Category "PowerShell Security" -Name "PowerShell Transcription Enabled" -Risk "Info" `
+            -Description "PowerShell transcription is enabled" `
+            -Details "Output Directory: $transcriptDir"
+    } else {
+        Add-Finding -Category "PowerShell Security" -Name "PowerShell Transcription Disabled" -Risk "Low" `
+            -Description "PowerShell transcription is not enabled" `
+            -Details "EnableTranscripting: $transcription" `
+            -Recommendation "Enable transcription for forensic logging"
+    }
+    
+    # Check for PS Remoting restrictions
+    try {
+        $psSessionConfig = Get-PSSessionConfiguration -Name Microsoft.PowerShell -ErrorAction Stop
+        
+        if ($psSessionConfig.Permission -match 'Everyone|Authenticated Users') {
+            Add-Finding -Category "PowerShell Security" -Name "PS Remoting Broadly Accessible" -Risk "Medium" `
+                -Description "PowerShell remoting may be accessible to broad groups" `
+                -Details "Permission: $($psSessionConfig.Permission)" `
+                -Recommendation "Restrict PS Remoting access to specific admin groups"
+        }
+    } catch { }
+}
+
+function Test-BrowserSecurity {
+    Write-AuditLog "Checking Browser Security Settings..." -Level "INFO"
+    
+    # Check IE Enhanced Security Configuration
+    $ieEsc = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}" -Name "IsInstalled" -Default 0
+    
+    if ($ieEsc -eq 1) {
+        Add-Finding -Category "Browser Security" -Name "IE Enhanced Security (Admin)" -Risk "Info" `
+            -Description "IE Enhanced Security Configuration is enabled for Administrators" `
+            -Details "IE ESC (Admin): Enabled"
+    }
+    
+    # Check Edge SmartScreen
+    $edgeSmartScreen = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Name "SmartScreenEnabled" -Default $null
+    
+    if ($edgeSmartScreen -eq 0) {
+        Add-Finding -Category "Browser Security" -Name "Edge SmartScreen Disabled" -Risk "Medium" `
+            -Description "Microsoft Edge SmartScreen is disabled via policy" `
+            -Details "SmartScreenEnabled: 0" `
+            -Recommendation "Enable SmartScreen for phishing and malware protection"
+    }
+    
+    # Check Chrome if installed
+    $chromeInstalled = Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe" -or 
+                       Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    
+    if ($chromeInstalled) {
+        $chromeSafeBrowsing = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Name "SafeBrowsingProtectionLevel" -Default $null
+        
+        if ($chromeSafeBrowsing -eq 0) {
+            Add-Finding -Category "Browser Security" -Name "Chrome Safe Browsing Disabled" -Risk "Medium" `
+                -Description "Chrome Safe Browsing is disabled via policy" `
+                -Details "SafeBrowsingProtectionLevel: 0" `
+                -Recommendation "Enable Safe Browsing protection"
+        }
+        
+        $chromeUpdates = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Google\Update" -Name "UpdateDefault" -Default $null
+        
+        if ($chromeUpdates -eq 0) {
+            Add-Finding -Category "Browser Security" -Name "Chrome Auto-Update Disabled" -Risk "High" `
+                -Description "Chrome automatic updates are disabled" `
+                -Details "UpdateDefault: 0" `
+                -Recommendation "Enable automatic updates for security patches"
+        }
+    }
+}
+
+function Test-DNSSecurity {
+    Write-AuditLog "Checking DNS Security Configuration..." -Level "INFO"
+    
+    # Check DNS-over-HTTPS
+    $dohPolicy = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Name "DoHPolicy" -Default $null
+    
+    if ($dohPolicy -eq 3 -or $dohPolicy -eq 2) {
+        Add-Finding -Category "DNS Security" -Name "DNS over HTTPS Enabled" -Risk "Info" `
+            -Description "DNS over HTTPS is enabled" `
+            -Details "DoHPolicy: $dohPolicy"
+    }
+    
+    # Check DNS devolution
+    $dnsDevolution = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient" -Name "UseDomainNameDevolution" -Default 1
+    
+    if ($dnsDevolution -eq 1) {
+        Add-Finding -Category "DNS Security" -Name "DNS Devolution Enabled" -Risk "Low" `
+            -Description "DNS devolution is enabled - may leak internal domain names" `
+            -Details "UseDomainNameDevolution: 1" `
+            -Recommendation "Disable DNS devolution if not required"
+    }
+    
+    # Check configured DNS servers
+    try {
+        $dnsServers = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction Stop | 
+            Where-Object { $_.ServerAddresses.Count -gt 0 } |
+            Select-Object -ExpandProperty ServerAddresses -Unique
+        
+        $publicDns = @{
+            "8.8.8.8" = "Google DNS"
+            "1.1.1.1" = "Cloudflare DNS"
+            "9.9.9.9" = "Quad9 DNS"
+        }
+        
+        $usingPublicDns = $dnsServers | Where-Object { $publicDns.ContainsKey($_) }
+        
+        if ($usingPublicDns) {
+            $dnsNames = ($usingPublicDns | ForEach-Object { "$_ ($($publicDns[$_]))" }) -join ", "
+            Add-Finding -Category "DNS Security" -Name "Public DNS Servers" -Risk "Info" `
+                -Description "System is using public DNS servers" `
+                -Details "Public DNS: $dnsNames"
+        }
+    } catch { }
+}
+
+function Test-FileSystemPermissions {
+    Write-AuditLog "Checking File System Security..." -Level "INFO"
+    
+    # Check for unattend.xml files
+    $unattendPaths = @(
+        "C:\unattend.xml",
+        "C:\Windows\Panther\unattend.xml",
+        "C:\Windows\Panther\Unattend\unattend.xml",
+        "C:\Windows\System32\Sysprep\unattend.xml"
+    )
+    
+    foreach ($path in $unattendPaths) {
+        if (Test-Path $path) {
+            Add-Finding -Category "File System" -Name "Unattend.xml Found" -Risk "Medium" `
+                -Description "Unattend.xml file found - may contain credentials" `
+                -Details "Path: $path" `
+                -Recommendation "Remove or secure unattend.xml files after deployment"
+        }
+    }
+    
+    # Check for world-writable directories in PATH
+    $pathDirs = $env:PATH -split ';' | Where-Object { $_ -and (Test-Path $_) }
+    
+    foreach ($dir in $pathDirs) {
+        if ($dir -match '^C:\\Windows|^C:\\Program Files') { continue }
+        
+        try {
+            $acl = Get-Acl -Path $dir -ErrorAction Stop
+            
+            foreach ($access in $acl.Access) {
+                if ($access.IdentityReference -match 'Everyone' -and $access.FileSystemRights -match 'Write|Modify|FullControl') {
+                    Add-Finding -Category "File System" -Name "World-Writable PATH Directory" -Risk "High" `
+                        -Description "A directory in system PATH is writable by Everyone" `
+                        -Details "Path: $dir" `
+                        -Recommendation "Remove Everyone write access from PATH directories"
+                    break
+                }
+            }
+        } catch { }
+    }
+}
+
+function Test-UserRightsAssignments {
+    Write-AuditLog "Checking User Rights Assignments..." -Level "INFO"
+    
+    try {
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        $null = secedit /export /cfg $tempFile /areas USER_RIGHTS 2>&1
+        
+        if (Test-Path $tempFile) {
+            $content = Get-Content $tempFile -Raw
+            
+            # Check for dangerous rights
+            if ($content -match "SeDebugPrivilege\s*=\s*(.+)") {
+                $assigned = $Matches[1].Trim()
+                if ($assigned -match '\*S-1-1-0|\*S-1-5-11|Everyone|Authenticated Users') {
+                    Add-Finding -Category "User Rights" -Name "Debug Programs Right Broadly Assigned" -Risk "High" `
+                        -Description "SeDebugPrivilege assigned to broad group" `
+                        -Details "Assigned to: $assigned" `
+                        -Recommendation "Restrict to Administrators only" `
+                        -Reference "CIS Benchmark 2.2"
+                }
+            }
+            
+            if ($content -match "SeTcbPrivilege\s*=\s*(.+)") {
+                $assigned = $Matches[1].Trim()
+                if ($assigned.Length -gt 0) {
+                    Add-Finding -Category "User Rights" -Name "Act as Part of OS Assigned" -Risk "Critical" `
+                        -Description "SeTcbPrivilege is assigned - rarely needed" `
+                        -Details "Assigned to: $assigned" `
+                        -Recommendation "Remove unless specifically required"
+                }
+            }
+            
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Add-Finding -Category "User Rights" -Name "Rights Check Failed" -Risk "Info" `
+            -Description "Could not check user rights assignments" `
+            -Details "Requires elevated privileges"
+    }
+}
+
+function Test-TimeSynchronization {
+    Write-AuditLog "Checking Time Synchronization..." -Level "INFO"
+    
+    $w32timeSvc = Get-Service -Name "W32Time" -ErrorAction SilentlyContinue
+    
+    if ($w32timeSvc.Status -ne 'Running') {
+        Add-Finding -Category "Time Sync" -Name "Windows Time Service Not Running" -Risk "Medium" `
+            -Description "Windows Time service is not running" `
+            -Details "Service Status: $($w32timeSvc.Status)" `
+            -Recommendation "Enable Windows Time service for accurate time synchronization"
+    }
+    
+    $ntpServer = Get-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters" -Name "NtpServer" -Default ""
+    $ntpType = Get-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters" -Name "Type" -Default ""
+    
+    if ([string]::IsNullOrEmpty($ntpServer) -or $ntpType -eq "NoSync") {
+        Add-Finding -Category "Time Sync" -Name "NTP Not Configured" -Risk "Medium" `
+            -Description "NTP time synchronization is not properly configured" `
+            -Details "NtpServer: $ntpServer, Type: $ntpType" `
+            -Recommendation "Configure NTP synchronization with reliable time servers"
+    } else {
+        Add-Finding -Category "Time Sync" -Name "NTP Configuration" -Risk "Info" `
+            -Description "NTP is configured" `
+            -Details "Server: $ntpServer"
+    }
+}
+
+function Test-GroupMemberships {
+    Write-AuditLog "Checking Privileged Group Memberships..." -Level "INFO"
+    
+    $privilegedGroups = @(
+        @{ Name = "Remote Desktop Users"; Risk = "Medium" }
+        @{ Name = "Remote Management Users"; Risk = "Medium" }
+        @{ Name = "Backup Operators"; Risk = "Medium" }
+        @{ Name = "Hyper-V Administrators"; Risk = "High" }
+    )
+    
+    foreach ($group in $privilegedGroups) {
+        try {
+            $members = Get-LocalGroupMember -Group $group.Name -ErrorAction Stop
+            $memberCount = @($members).Count
+            
+            if ($memberCount -gt 0) {
+                $memberNames = ($members.Name | Select-Object -First 5) -join ", "
+                if ($memberCount -gt 5) { $memberNames += "... (+$($memberCount - 5) more)" }
+                
+                Add-Finding -Category "Group Memberships" -Name "$($group.Name) Group" -Risk "Info" `
+                    -Description "Members of $($group.Name) group" `
+                    -Details "Member count: $memberCount`nMembers: $memberNames" `
+                    -Recommendation "Review membership and apply least privilege"
+            }
+        } catch { }
+    }
+}
+
+function Test-DMAProtection {
+    Write-AuditLog "Checking DMA Protection Settings..." -Level "INFO"
+    
+    $blDmaProtection = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\FVE" -Name "DisableExternalDMAUnderLock" -Default $null
+    
+    if ($blDmaProtection -ne 1) {
+        try {
+            $tbControllers = Get-PnpDevice -Class "Thunderbolt" -ErrorAction SilentlyContinue
+            if ($tbControllers) {
+                Add-Finding -Category "DMA Protection" -Name "Thunderbolt DMA Protection" -Risk "Medium" `
+                    -Description "Thunderbolt detected but DMA protection may not be fully enabled" `
+                    -Details "DisableExternalDMAUnderLock not set to 1" `
+                    -Recommendation "Enable Kernel DMA Protection in BIOS and Windows"
+            }
+        } catch { }
+    } else {
+        Add-Finding -Category "DMA Protection" -Name "DMA Protection Enabled" -Risk "Info" `
+            -Description "DMA protection is configured" `
+            -Details "DisableExternalDMAUnderLock: 1"
+    }
+}
+
+function Test-HotfixStatus {
+    Write-AuditLog "Checking Installed Hotfixes..." -Level "INFO"
+    
+    try {
+        $hotfixes = Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending
+        $recentHotfixes = @($hotfixes | Where-Object { $_.InstalledOn -gt (Get-Date).AddDays(-30) })
+        
+        Add-Finding -Category "Hotfixes" -Name "Installed Hotfixes" -Risk "Info" `
+            -Description "System hotfix inventory" `
+            -Details "Total hotfixes: $($hotfixes.Count)`nRecent (30 days): $($recentHotfixes.Count)`nLast: $(($hotfixes | Select-Object -First 1).HotFixID)"
+        
+        if ($hotfixes.Count -gt 0) {
+            $lastUpdate = ($hotfixes | Select-Object -First 1).InstalledOn
+            if ($lastUpdate -and $lastUpdate -lt (Get-Date).AddDays(-60)) {
+                Add-Finding -Category "Hotfixes" -Name "Stale Hotfix Installation" -Risk "High" `
+                    -Description "No hotfixes installed in the last 60 days" `
+                    -Details "Last hotfix: $lastUpdate" `
+                    -Recommendation "Check Windows Update and apply pending patches"
+            }
+        }
+    } catch {
+        Add-Finding -Category "Hotfixes" -Name "Hotfix Check Failed" -Risk "Info" `
+            -Description "Could not retrieve hotfix information" `
+            -Details "Error: $_"
+    }
+}
+
+function Test-RegistryPermissions {
+    Write-AuditLog "Checking Registry Security..." -Level "INFO"
+    
+    $autorunKeys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+    )
+    
+    foreach ($keyPath in $autorunKeys) {
+        try {
+            $acl = Get-Acl -Path $keyPath -ErrorAction Stop
+            
+            foreach ($access in $acl.Access) {
+                if ($access.IdentityReference -match 'BUILTIN\\Users' -and $access.RegistryRights -match 'SetValue|FullControl') {
+                    Add-Finding -Category "Registry Security" -Name "Writable AutoRun Key" -Risk "High" `
+                        -Description "AutoRun registry key is writable by Users group" `
+                        -Details "Key: $keyPath" `
+                        -Recommendation "Remove write permissions for Users group"
+                }
+            }
+        } catch { }
+    }
+}
+
+function Test-ShadowCopies {
+    Write-AuditLog "Checking Volume Shadow Copies..." -Level "INFO"
+    
+    try {
+        $shadows = Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction Stop
+        
+        if ($shadows) {
+            $shadowCount = @($shadows).Count
+            Add-Finding -Category "Backup/Recovery" -Name "Shadow Copies Available" -Risk "Info" `
+                -Description "Volume Shadow Copies are available" `
+                -Details "Shadow copy count: $shadowCount"
+        } else {
+            Add-Finding -Category "Backup/Recovery" -Name "No Shadow Copies" -Risk "Low" `
+                -Description "No Volume Shadow Copies found" `
+                -Details "Shadow copies can help recover from ransomware" `
+                -Recommendation "Consider enabling System Protection"
+        }
+    } catch { }
+    
+    $srDisabled = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore" -Name "DisableSR" -Default 0
+    
+    if ($srDisabled -eq 1) {
+        Add-Finding -Category "Backup/Recovery" -Name "System Restore Disabled" -Risk "Low" `
+            -Description "System Restore is disabled by policy" `
+            -Details "DisableSR: 1" `
+            -Recommendation "Consider enabling System Restore"
+    }
+}
+
+function Test-DriverSigning {
+    Write-AuditLog "Checking Driver Signing Configuration..." -Level "INFO"
+    
+    try {
+        $bcdeditOutput = bcdedit /enum "{current}" 2>&1
+        
+        if ($bcdeditOutput -match "testsigning\s+Yes") {
+            Add-Finding -Category "Driver Security" -Name "Test Signing Enabled" -Risk "High" `
+                -Description "Windows test signing mode is enabled" `
+                -Details "Test signing allows unsigned drivers" `
+                -Recommendation "Disable test signing: bcdedit /set testsigning off"
+        }
+        
+        if ($bcdeditOutput -match "nointegritychecks\s+Yes") {
+            Add-Finding -Category "Driver Security" -Name "Integrity Checks Disabled" -Risk "Critical" `
+                -Description "Driver integrity checks are disabled" `
+                -Details "nointegritychecks is set to Yes" `
+                -Recommendation "Enable integrity checks: bcdedit /set nointegritychecks off"
+        }
+    } catch { }
+}
+
+function Test-WindowsSubsystems {
+    Write-AuditLog "Checking Windows Subsystems..." -Level "INFO"
+    
+    # Check WSL
+    try {
+        $wsl = Get-WindowsOptionalFeature -Online -FeatureName "Microsoft-Windows-Subsystem-Linux" -ErrorAction SilentlyContinue
+        
+        if ($wsl.State -eq "Enabled") {
+            Add-Finding -Category "Windows Subsystems" -Name "WSL Enabled" -Risk "Info" `
+                -Description "Windows Subsystem for Linux is enabled" `
+                -Details "May provide additional attack surface" `
+                -Recommendation "Disable if not required"
+        }
+    } catch { }
+    
+    # Check Hyper-V
+    try {
+        $hyperv = Get-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V" -ErrorAction SilentlyContinue
+        
+        if ($hyperv.State -eq "Enabled") {
+            Add-Finding -Category "Windows Subsystems" -Name "Hyper-V Enabled" -Risk "Info" `
+                -Description "Hyper-V is enabled" `
+                -Details "Virtualization platform is active" `
+                -Recommendation "Ensure Hyper-V admin access is properly restricted"
+        }
+    } catch { }
+    
+    # Check IIS
+    try {
+        $iis = Get-WindowsOptionalFeature -Online -FeatureName "IIS-WebServer" -ErrorAction SilentlyContinue
+        
+        if ($iis.State -eq "Enabled") {
+            Add-Finding -Category "Windows Subsystems" -Name "IIS Web Server Enabled" -Risk "Info" `
+                -Description "Internet Information Services is enabled" `
+                -Details "Web server is installed" `
+                -Recommendation "Apply IIS security hardening"
+        }
+    } catch { }
+}
+
+function Test-TelemetryPrivacy {
+    Write-AuditLog "Checking Telemetry and Privacy Settings..." -Level "INFO"
+    
+    # Check Windows Telemetry Level
+    $telemetryLevel = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" -Name "AllowTelemetry" -Default $null
+    
+    if ($null -eq $telemetryLevel) {
+        $telemetryLevel = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" -Name "AllowTelemetry" -Default 3
+    }
+    
+    $levelDesc = switch ($telemetryLevel) {
+        0 { "Security (Enterprise only)" }
+        1 { "Basic" }
+        2 { "Enhanced" }
+        3 { "Full" }
+        default { "Unknown ($telemetryLevel)" }
+    }
+    
+    if ($telemetryLevel -ge 3) {
+        Add-Finding -Category "Privacy" -Name "Full Telemetry Enabled" -Risk "Low" `
+            -Description "Windows telemetry is set to Full" `
+            -Details "AllowTelemetry: $telemetryLevel ($levelDesc)" `
+            -Recommendation "Consider reducing telemetry level for privacy"
+    } else {
+        Add-Finding -Category "Privacy" -Name "Telemetry Level" -Risk "Info" `
+            -Description "Windows telemetry level is configured" `
+            -Details "AllowTelemetry: $telemetryLevel ($levelDesc)"
+    }
+    
+    # Check Cortana
+    $cortanaEnabled = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" -Name "AllowCortana" -Default 1
+    
+    if ($cortanaEnabled -eq 1) {
+        Add-Finding -Category "Privacy" -Name "Cortana Enabled" -Risk "Info" `
+            -Description "Cortana is enabled" `
+            -Details "AllowCortana: 1" `
+            -Recommendation "Consider disabling for privacy/security"
+    }
+    
+    # Check Activity History
+    $activityHistory = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" -Name "PublishUserActivities" -Default 1
+    
+    if ($activityHistory -eq 1) {
+        Add-Finding -Category "Privacy" -Name "Activity History Enabled" -Risk "Info" `
+            -Description "Windows Activity History is enabled" `
+            -Details "PublishUserActivities: 1"
+    }
+    
+    # Check Error Reporting
+    $werDisabled = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting" -Name "Disabled" -Default 0
+    
+    if ($werDisabled -eq 0) {
+        Add-Finding -Category "Privacy" -Name "Error Reporting Enabled" -Risk "Info" `
+            -Description "Windows Error Reporting is enabled" `
+            -Details "Error reports may contain sensitive data"
+    }
+}
+
+function Test-CredentialCaching {
+    Write-AuditLog "Checking Credential Caching Settings..." -Level "INFO"
+    
+    # Check cached logons count
+    $cachedLogons = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "CachedLogonsCount" -Default "10"
+    
+    if ([int]$cachedLogons -gt 4) {
+        Add-Finding -Category "Credential Security" -Name "High Cached Logons Count" -Risk "Low" `
+            -Description "Domain credential cache count is higher than recommended" `
+            -Details "CachedLogonsCount: $cachedLogons (recommended: 4 or less)" `
+            -Recommendation "Reduce cached logons to minimize offline attack risk"
+    }
+    
+    # Check plain text password storage
+    $reversibleEncryption = Get-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "NoLMHash" -Default 1
+    
+    if ($reversibleEncryption -ne 1) {
+        Add-Finding -Category "Credential Security" -Name "LM Hash Storage Enabled" -Risk "High" `
+            -Description "LM hashes may be stored (NoLMHash not set)" `
+            -Details "NoLMHash: $reversibleEncryption" `
+            -Recommendation "Set NoLMHash to 1 to prevent LM hash storage"
+    }
+    
+    # Check for Digest Authentication (WDigest)
+    $wdigest = Get-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest" -Name "UseLogonCredential" -Default 0
+    
+    if ($wdigest -eq 1) {
+        Add-Finding -Category "Credential Security" -Name "WDigest Credential Caching" -Risk "High" `
+            -Description "WDigest is caching credentials in memory" `
+            -Details "UseLogonCredential: 1" `
+            -Recommendation "Set UseLogonCredential to 0"
+    }
+    
+    # Check Network Level Authentication for RDP
+    $nla = Get-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Default 1
+    
+    if ($nla -ne 1) {
+        Add-Finding -Category "Credential Security" -Name "RDP NLA Disabled" -Risk "Medium" `
+            -Description "Network Level Authentication is disabled for RDP" `
+            -Details "UserAuthentication: $nla" `
+            -Recommendation "Enable NLA for RDP connections"
+    }
+}
+
 # ============================================================================
 # HTML REPORT GENERATION
 # ============================================================================
@@ -2467,13 +3091,27 @@ function New-HtmlReport {
     $scoreColor = if ($score -ge 80) { "#28a745" } elseif ($score -ge 60) { "#ffc107" } elseif ($score -ge 40) { "#fd7e14" } else { "#dc3545" }
     $scoreGrade = if ($score -ge 90) { "A" } elseif ($score -ge 80) { "B" } elseif ($score -ge 70) { "C" } elseif ($score -ge 60) { "D" } else { "F" }
     
+    # Determine admin status display for header
+    $headerAdminStatus = if ($Script:SystemInfo.IsAdmin) {
+        "<span style='color: #90EE90;'>✓ Administrator</span>"
+    } else {
+        "<span style='color: #ff6b6b; font-weight: bold;'>⛔ NOT ADMIN - LIMITED RESULTS</span>"
+    }
+    
+    # Determine page title
+    $pageTitle = if ($Script:SystemInfo.IsAdmin) {
+        "Windows Security Audit Report - $($Script:Hostname)"
+    } else {
+        "⚠️ INCOMPLETE - Windows Security Audit Report - $($Script:Hostname)"
+    }
+    
     $html = @"
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Windows Security Audit Report - $($Script:Hostname)</title>
+    <title>$pageTitle</title>
     <style>
         :root {
             --critical: #dc3545;
@@ -2709,6 +3347,32 @@ function New-HtmlReport {
             font-size: 13px;
         }
         
+        .admin-warning {
+            background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+            color: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            font-size: 15px;
+            box-shadow: 0 4px 12px rgba(220, 53, 69, 0.4);
+        }
+        
+        .admin-warning h2 {
+            font-size: 20px;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .admin-warning ul {
+            margin: 10px 0 0 20px;
+        }
+        
+        .admin-warning li {
+            margin: 5px 0;
+        }
+        
         .disclaimer {
             background: #fff3cd;
             border: 1px solid #ffc107;
@@ -2741,6 +3405,7 @@ function New-HtmlReport {
                     <div><strong>Audit Date:</strong> $($Script:AuditDate)</div>
                     <div><strong>Auditor:</strong> $($Script:SystemInfo.CurrentUser)</div>
                     <div><strong>Tool Version:</strong> $($Script:AuditVersion)</div>
+                    <div><strong>Privileges:</strong> $headerAdminStatus</div>
                 </div>
             </div>
             <div class="score-circle">
@@ -2751,10 +3416,36 @@ function New-HtmlReport {
             </div>
         </header>
         
+"@
+
+    # Add prominent warning if not running as admin
+    if (-not $Script:SystemInfo.IsAdmin) {
+        $html += @"
+        <div class="admin-warning">
+            <h2>⛔ LIMITED SCAN - NOT RUNNING AS ADMINISTRATOR</h2>
+            <p>This audit was executed <strong>without administrative privileges</strong>. The results are <strong>incomplete</strong> and may not reflect the true security posture of this system.</p>
+            <p><strong>The following checks are affected or unavailable:</strong></p>
+            <ul>
+                <li>Security policy and audit policy settings</li>
+                <li>Full service and driver enumeration</li>
+                <li>BitLocker encryption status</li>
+                <li>Credential protection settings (LSA, Credential Guard)</li>
+                <li>Windows Defender and ASR configuration</li>
+                <li>User rights assignments</li>
+                <li>Registry permissions on protected keys</li>
+                <li>Hardware security features (Secure Boot, TPM, VBS)</li>
+                <li>Many other security-critical settings</li>
+            </ul>
+            <p style="margin-top: 15px;"><strong>⚠️ ACTION REQUIRED:</strong> Re-run this audit from an elevated PowerShell prompt (Run as Administrator) for complete results.</p>
+        </div>
+        
+"@
+    }
+
+    $html += @"
         <div class="disclaimer">
             <strong>⚠️ Disclaimer:</strong> This report is generated for authorized security compliance auditing purposes only. 
-            Findings should be validated by qualified security personnel before taking remediation actions.
-            Some checks require administrative privileges for complete results.
+            Findings should be validated by qualified security personnel before taking remediation actions.$(if (-not $Script:SystemInfo.IsAdmin) { " <strong>NOTE: This scan was run without admin rights - results are incomplete.</strong>" })
         </div>
         
         <div class="summary-grid">
@@ -2792,6 +3483,12 @@ function New-HtmlReport {
         $html += "                <li><a href='#$catId'>$cat</a></li>`n"
     }
     
+    $adminStatusHtml = if ($Script:SystemInfo.IsAdmin) {
+        "<span style='color: #28a745; font-weight: bold;'>✓ Yes</span>"
+    } else {
+        "<span style='color: #dc3545; font-weight: bold;'>⛔ NO - RESULTS INCOMPLETE</span>"
+    }
+    
     $html += @"
             </ul>
         </div>
@@ -2807,7 +3504,7 @@ function New-HtmlReport {
                 <div class="system-info-item"><span class="label">Last Boot</span><span class="value">$($Script:SystemInfo.LastBoot)</span></div>
                 <div class="system-info-item"><span class="label">Total Memory</span><span class="value">$($Script:SystemInfo.TotalMemoryGB) GB</span></div>
                 <div class="system-info-item"><span class="label">PowerShell Version</span><span class="value">$($Script:SystemInfo.PowerShellVer)</span></div>
-                <div class="system-info-item"><span class="label">Running as Admin</span><span class="value">$($Script:SystemInfo.IsAdmin)</span></div>
+                <div class="system-info-item"><span class="label">Running as Admin</span><span class="value">$adminStatusHtml</span></div>
             </div>
         </div>
 "@
@@ -2915,18 +3612,34 @@ function Start-SecurityAudit {
         { Test-SecureBoot },
         { Test-DefenderASR },
         { Test-AppLockerWDAC },
+        { Test-ExploitProtection },
         { Test-InstalledSoftware },
         { Test-OfficeSecurity },
+        { Test-BrowserSecurity },
+        { Test-PowerShellSecurity },
         { Test-ScheduledTasks },
         { Test-UpdateStatus },
+        { Test-HotfixStatus },
         { Test-BitLockerStatus },
         { Test-CredentialStorage },
+        { Test-CredentialCaching },
         { Test-LAPS },
         { Test-AutoRunLocations },
         { Test-MediaAutoPlay },
         { Test-EventLogConfiguration },
         { Test-InactivityTimeout },
-        { Test-CertificateSecurity }
+        { Test-CertificateSecurity },
+        { Test-DNSSecurity },
+        { Test-FileSystemPermissions },
+        { Test-RegistryPermissions },
+        { Test-UserRightsAssignments },
+        { Test-GroupMemberships },
+        { Test-TimeSynchronization },
+        { Test-DMAProtection },
+        { Test-DriverSigning },
+        { Test-ShadowCopies },
+        { Test-WindowsSubsystems },
+        { Test-TelemetryPrivacy }
     )
     
     foreach ($module in $modules) {
