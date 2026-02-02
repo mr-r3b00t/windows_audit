@@ -2593,8 +2593,7 @@ function Test-BrowserSecurity {
     }
     
     # Check Chrome if installed
-    $chromeInstalled = Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe" -or 
-                       Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    $chromeInstalled = (Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe") -or (Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe")
     
     if ($chromeInstalled) {
         $chromeSafeBrowsing = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Name "SafeBrowsingProtectionLevel" -Default $null
