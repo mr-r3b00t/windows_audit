@@ -2265,40 +2265,55 @@ function Test-RemoteAccess {
             -Reference "CIS Benchmark 18.9.64.1"
     }
     
-    # Check WinRM configuration
+    # Check WinRM configuration via registry (avoids starting the service)
+    # Only report on WinRM settings if the service exists
     $winrmService = Get-Service -Name "WinRM" -ErrorAction SilentlyContinue
-    if ($winrmService -and $winrmService.Status -eq 'Running') {
-        try {
-            $winrmConfig = winrm get winrm/config/service 2>&1
-            
-            # Check for HTTP listener
-            $httpListener = winrm enumerate winrm/config/listener 2>&1
-            if ($httpListener -match 'Transport = HTTP[^S]') {
-                Add-Finding -Category "Remote Access" -Name "WinRM HTTP Listener" -Risk "Medium" `
-                    -Description "WinRM has an HTTP (non-encrypted) listener" `
-                    -Details "WinRM is accepting connections over unencrypted HTTP" `
-                    -Recommendation "Use HTTPS for WinRM or disable HTTP listener" `
-                    -Reference "Security Best Practice"
+    if ($winrmService) {
+        $winrmRunning = $winrmService.Status -eq 'Running'
+        
+        # Check AllowUnencrypted via registry
+        $allowUnencrypted = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Service" -Name "allow_unencrypted" -Default 0
+        if ($allowUnencrypted -eq 1) {
+            Add-Finding -Category "Remote Access" -Name "WinRM Allows Unencrypted" -Risk "High" `
+                -Description "WinRM is configured to allow unencrypted traffic" `
+                -Details "allow_unencrypted = 1 (Service running: $winrmRunning)" `
+                -Recommendation "Set AllowUnencrypted to false: winrm set winrm/config/service @{AllowUnencrypted=`"false`"}" `
+                -Reference "CIS Benchmark"
+        }
+        
+        # Check Basic Auth via registry
+        $basicAuth = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Service" -Name "auth_basic" -Default 0
+        if ($basicAuth -eq 1) {
+            Add-Finding -Category "Remote Access" -Name "WinRM Basic Auth Enabled" -Risk "Medium" `
+                -Description "WinRM allows Basic authentication" `
+                -Details "auth_basic = 1 (Service running: $winrmRunning)" `
+                -Recommendation "Disable Basic authentication if not required"
+        }
+        
+        # Check for HTTP listeners via registry
+        $listenerPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Listener"
+        if (Test-Path $listenerPath) {
+            $listeners = Get-ChildItem -Path $listenerPath -ErrorAction SilentlyContinue
+            foreach ($listener in $listeners) {
+                $transport = Get-RegistryValue -Path $listener.PSPath -Name "transport" -Default ""
+                $port = Get-RegistryValue -Path $listener.PSPath -Name "port" -Default ""
+                
+                if ($transport -eq "HTTP") {
+                    Add-Finding -Category "Remote Access" -Name "WinRM HTTP Listener Configured" -Risk "Medium" `
+                        -Description "WinRM has an HTTP (non-encrypted) listener configured" `
+                        -Details "Transport: HTTP, Port: $port (Service running: $winrmRunning)" `
+                        -Recommendation "Use HTTPS for WinRM or remove HTTP listener" `
+                        -Reference "Security Best Practice"
+                }
             }
-            
-            # Check AllowUnencrypted
-            if ($winrmConfig -match 'AllowUnencrypted\s*=\s*true') {
-                Add-Finding -Category "Remote Access" -Name "WinRM Allows Unencrypted" -Risk "High" `
-                    -Description "WinRM is configured to allow unencrypted traffic" `
-                    -Details "AllowUnencrypted = true" `
-                    -Recommendation "Set AllowUnencrypted to false" `
-                    -Reference "CIS Benchmark"
-            }
-            
-            # Check Basic Auth
-            if ($winrmConfig -match 'Basic\s*=\s*true') {
-                Add-Finding -Category "Remote Access" -Name "WinRM Basic Auth Enabled" -Risk "Medium" `
-                    -Description "WinRM allows Basic authentication" `
-                    -Details "Basic authentication sends credentials in cleartext" `
-                    -Recommendation "Disable Basic authentication if not required"
-            }
-            
-        } catch { }
+        }
+        
+        # Report WinRM status
+        if ($winrmRunning) {
+            Add-Finding -Category "Remote Access" -Name "WinRM Service Running" -Risk "Info" `
+                -Description "Windows Remote Management service is running" `
+                -Details "Verify WinRM is properly secured if intentionally enabled"
+        }
     }
     
     # Check SSH Server
@@ -2557,17 +2572,20 @@ function Test-PowerShellSecurity {
             -Recommendation "Enable transcription for forensic logging"
     }
     
-    # Check for PS Remoting restrictions
-    try {
-        $psSessionConfig = Get-PSSessionConfiguration -Name Microsoft.PowerShell -ErrorAction Stop
-        
-        if ($psSessionConfig.Permission -match 'Everyone|Authenticated Users') {
-            Add-Finding -Category "PowerShell Security" -Name "PS Remoting Broadly Accessible" -Risk "Medium" `
-                -Description "PowerShell remoting may be accessible to broad groups" `
-                -Details "Permission: $($psSessionConfig.Permission)" `
-                -Recommendation "Restrict PS Remoting access to specific admin groups"
-        }
-    } catch { }
+    # Check for PS Remoting restrictions (only if WinRM is already running to avoid starting it)
+    $winrmSvc = Get-Service -Name "WinRM" -ErrorAction SilentlyContinue
+    if ($winrmSvc -and $winrmSvc.Status -eq 'Running') {
+        try {
+            $psSessionConfig = Get-PSSessionConfiguration -Name Microsoft.PowerShell -ErrorAction Stop
+            
+            if ($psSessionConfig.Permission -match 'Everyone|Authenticated Users') {
+                Add-Finding -Category "PowerShell Security" -Name "PS Remoting Broadly Accessible" -Risk "Medium" `
+                    -Description "PowerShell remoting may be accessible to broad groups" `
+                    -Details "Permission: $($psSessionConfig.Permission)" `
+                    -Recommendation "Restrict PS Remoting access to specific admin groups"
+            }
+        } catch { }
+    }
 }
 
 function Test-BrowserSecurity {
