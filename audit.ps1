@@ -375,6 +375,204 @@ function Get-SystemInformation {
         -Description "Hardware identification and specification" `
         -Details "Make/Model: $($Script:SystemInfo.Manufacturer) $($Script:SystemInfo.Model)`nSerial: $($Script:SystemInfo.SerialNumber)`nBIOS: $($Script:SystemInfo.BIOSVersion) ($($Script:SystemInfo.BIOSDate))`nCPU: $($Script:SystemInfo.CPU) ($($Script:SystemInfo.CPUCores)C/$($Script:SystemInfo.CPUThreads)T @ $($Script:SystemInfo.CPUMaxSpeed))`nRAM: $($Script:SystemInfo.TotalMemoryGB) GB$(if ($ramModules.Count -gt 0) { " [$($ramModules -join ' + ')]" })`nGPU: $(($gpuDetails | ForEach-Object { "$($_.Name) ($($_.VRAM))" }) -join '; ')`nUptime: $($Script:SystemInfo.Uptime) (since $lastBootStr)"
     
+    # Virtual Machine Detection
+    $vmDetected = $false
+    $vmPlatform = "Physical"
+    $vmIndicators = @()
+    
+    $mfr = ($Script:SystemInfo.Manufacturer).ToLower()
+    $model = ($Script:SystemInfo.Model).ToLower()
+    $biosVer = if ($Script:SystemInfo.BIOSVersion) { ($Script:SystemInfo.BIOSVersion).ToLower() } else { "" }
+    
+    # Check manufacturer/model strings
+    if ($mfr -match 'vmware' -or $model -match 'vmware') {
+        $vmDetected = $true; $vmPlatform = "VMware"
+        $vmIndicators += "Manufacturer/Model contains 'VMware'"
+    }
+    elseif ($mfr -match 'microsoft' -and $model -match 'virtual') {
+        $vmDetected = $true; $vmPlatform = "Hyper-V"
+        $vmIndicators += "Model: Microsoft Virtual Machine"
+    }
+    elseif ($mfr -match 'innotek' -or $model -match 'virtualbox') {
+        $vmDetected = $true; $vmPlatform = "VirtualBox"
+        $vmIndicators += "Manufacturer/Model contains 'VirtualBox'"
+    }
+    elseif ($mfr -match 'qemu' -or $model -match 'qemu' -or $model -match 'standard pc' -or $model -match 'bochs') {
+        $vmDetected = $true; $vmPlatform = "QEMU/KVM"
+        $vmIndicators += "Manufacturer/Model indicates QEMU/KVM"
+    }
+    elseif ($mfr -match 'xen' -or $model -match 'xen' -or $model -match 'hvm domu') {
+        $vmDetected = $true; $vmPlatform = "Xen"
+        $vmIndicators += "Manufacturer/Model contains 'Xen'"
+    }
+    elseif ($mfr -match 'parallels' -or $model -match 'parallels') {
+        $vmDetected = $true; $vmPlatform = "Parallels"
+        $vmIndicators += "Manufacturer/Model contains 'Parallels'"
+    }
+    elseif ($mfr -match 'amazon' -or $model -match 'amazon' -or $biosVer -match 'amazon') {
+        $vmDetected = $true; $vmPlatform = "Amazon EC2"
+        $vmIndicators += "Manufacturer/BIOS indicates Amazon EC2"
+    }
+    elseif ($mfr -match 'google' -or $model -match 'google') {
+        $vmDetected = $true; $vmPlatform = "Google Cloud"
+        $vmIndicators += "Manufacturer indicates Google Cloud"
+    }
+    elseif ($biosVer -match 'vbox' -or $biosVer -match 'vmware' -or $biosVer -match 'virtual') {
+        $vmDetected = $true; $vmPlatform = "Virtual Machine (BIOS)"
+        $vmIndicators += "BIOS version contains virtualisation indicator"
+    }
+    
+    # Check for hypervisor via WMI if not already detected
+    if (-not $vmDetected) {
+        if ($cs.HypervisorPresent -eq $true) {
+            $vmDetected = $true
+            $vmPlatform = "Hypervisor Detected"
+            $vmIndicators += "Win32_ComputerSystem.HypervisorPresent = True"
+        }
+    } else {
+        if ($cs.HypervisorPresent -eq $true) {
+            $vmIndicators += "HypervisorPresent: True"
+        }
+    }
+    
+    # Check SMBIOS system family and baseboard
+    if (-not $vmDetected -and $baseboard) {
+        $bbProduct = if ($baseboard.Product) { $baseboard.Product.ToLower() } else { "" }
+        $bbMfr = if ($baseboard.Manufacturer) { $baseboard.Manufacturer.ToLower() } else { "" }
+        if ($bbProduct -match 'virtual|vmware|vbox|qemu|xen' -or $bbMfr -match 'virtual|vmware|vbox|qemu|xen') {
+            $vmDetected = $true; $vmPlatform = "Virtual Machine (Baseboard)"
+            $vmIndicators += "Baseboard: $($baseboard.Manufacturer) $($baseboard.Product)"
+        }
+    }
+    
+    # Check for VM-specific services
+    $vmServices = @(
+        @{ Name = "vmtools";      Platform = "VMware" },
+        @{ Name = "vmtoolsd";     Platform = "VMware" },
+        @{ Name = "VMUSBArbService"; Platform = "VMware" },
+        @{ Name = "vmicheartbeat"; Platform = "Hyper-V" },
+        @{ Name = "vmicshutdown"; Platform = "Hyper-V" },
+        @{ Name = "vmickvpexchange"; Platform = "Hyper-V" },
+        @{ Name = "vmicguestinterface"; Platform = "Hyper-V" },
+        @{ Name = "VBoxService";  Platform = "VirtualBox" },
+        @{ Name = "VBoxClient";   Platform = "VirtualBox" }
+    )
+    
+    foreach ($svc in $vmServices) {
+        $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+        if ($service) {
+            if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = $svc.Platform }
+            $vmIndicators += "VM service found: $($svc.Name) ($($service.Status))"
+        }
+    }
+    
+    # Check for VM-specific registry keys
+    $vmRegChecks = @(
+        @{ Path = "HKLM:\SOFTWARE\VMware, Inc.\VMware Tools"; Platform = "VMware" },
+        @{ Path = "HKLM:\SOFTWARE\Oracle\VirtualBox Guest Additions"; Platform = "VirtualBox" },
+        @{ Path = "HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters"; Platform = "Hyper-V" }
+    )
+    
+    foreach ($reg in $vmRegChecks) {
+        if (Test-Path $reg.Path) {
+            if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = $reg.Platform }
+            $vmIndicators += "VM registry key: $($reg.Path)"
+        }
+    }
+    
+    # Check MAC address OUI for known VM vendors
+    try {
+        $nics = Get-CimInstance -ClassName Win32_NetworkAdapter -Filter "MACAddress IS NOT NULL" -ErrorAction SilentlyContinue
+        if ($nics) {
+            $nicList = if ($nics -is [array]) { $nics } else { @($nics) }
+            foreach ($nic in $nicList) {
+                if ($nic.MACAddress) {
+                    $mac = $nic.MACAddress.ToUpper()
+                    $oui = $mac.Substring(0, 8)
+                    $vmMac = switch -Wildcard ($oui) {
+                        "00:50:56*" { "VMware" }
+                        "00:0C:29*" { "VMware" }
+                        "00:05:69*" { "VMware" }
+                        "00:15:5D*" { "Hyper-V" }
+                        "08:00:27*" { "VirtualBox" }
+                        "52:54:00*" { "QEMU/KVM" }
+                        "00:16:3E*" { "Xen" }
+                        "00:1C:42*" { "Parallels" }
+                        default { $null }
+                    }
+                    if ($vmMac) {
+                        if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = $vmMac }
+                        $vmIndicators += "VM MAC OUI: $mac ($($nic.Name)) -> $vmMac"
+                        break
+                    }
+                }
+            }
+        }
+    } catch { }
+    
+    # Check for VM-specific hardware (disk, video)
+    try {
+        $diskModels = Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Model
+        if ($diskModels) {
+            foreach ($disk in $diskModels) {
+                $diskLower = $disk.ToLower()
+                if ($diskLower -match 'vmware|virtual|vbox|qemu|xen') {
+                    if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = "Virtual Machine (Disk)" }
+                    $vmIndicators += "VM disk: $disk"
+                }
+            }
+        }
+    } catch { }
+    
+    # Store in SystemInfo
+    $Script:SystemInfo | Add-Member -NotePropertyName "IsVirtualMachine" -NotePropertyValue $vmDetected -Force
+    $Script:SystemInfo | Add-Member -NotePropertyName "VMPlatform" -NotePropertyValue $vmPlatform -Force
+    $Script:SystemInfo | Add-Member -NotePropertyName "VMIndicators" -NotePropertyValue $vmIndicators -Force
+    
+    if ($vmDetected) {
+        $detailStr = "Platform: $vmPlatform`nDetection indicators:`n$(($vmIndicators | ForEach-Object { "  - $_" }) -join "`n")"
+        
+        Add-Finding -Category "System Info" -Name "Virtual Machine Detected" -Risk "Info" `
+            -Description "This system is running as a $vmPlatform virtual machine" `
+            -Details $detailStr
+        
+        # Security implications for VMs
+        $vmSecDetails = @()
+        
+        # Check if VM tools are installed and up to date
+        if ($vmPlatform -eq "VMware") {
+            $vmToolsVer = Get-RegistryValue -Path "HKLM:\SOFTWARE\VMware, Inc.\VMware Tools" -Name "ProductVersion" -Default $null
+            if ($vmToolsVer) {
+                $vmSecDetails += "VMware Tools version: $vmToolsVer"
+            } else {
+                $vmSecDetails += "VMware Tools: Not detected or not installed"
+            }
+        }
+        
+        # Check for Hyper-V enhanced session
+        if ($vmPlatform -eq "Hyper-V") {
+            $hvGuest = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters" -Name "HostName" -Default $null
+            if ($hvGuest) { $vmSecDetails += "Hyper-V Host: $hvGuest" }
+            $hvVmName = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters" -Name "VirtualMachineName" -Default $null
+            if ($hvVmName) { $vmSecDetails += "VM Name: $hvVmName" }
+        }
+        
+        # Nested virtualisation check
+        if ($cs.HypervisorPresent -eq $true -and $vmDetected) {
+            $vmSecDetails += "Nested virtualisation may be available (hypervisor present inside VM)"
+        }
+        
+        if ($vmSecDetails.Count -gt 0) {
+            Add-Finding -Category "System Info" -Name "VM Platform Details" -Risk "Info" `
+                -Description "Additional virtual machine platform information" `
+                -Details ($vmSecDetails -join "`n")
+        }
+    } else {
+        Add-Finding -Category "System Info" -Name "Physical Hardware" -Risk "Info" `
+            -Description "No virtualisation indicators detected - system appears to be running on physical hardware" `
+            -Details "Manufacturer: $($Script:SystemInfo.Manufacturer)`nModel: $($Script:SystemInfo.Model)"
+    }
+    
     # CRITICAL: Warn if not running as admin
     if (-not $Script:SystemInfo.IsAdmin) {
         Add-Finding -Category "System Info" -Name "[!!] SCAN RUN WITHOUT ADMIN RIGHTS" -Risk "Critical" `
@@ -5624,6 +5822,13 @@ function New-HtmlReport {
         <div class="section">
             <div class="section-header"> Hardware Summary</div>
             <div class="system-info-grid">
+                <div class="system-info-item"><span class="label">Platform Type</span><span class="value">$(
+                    if ($Script:SystemInfo.IsVirtualMachine) {
+                        "<span style='background: #6f42c1; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px;'>Virtual Machine</span> &nbsp;$(ConvertTo-HtmlSafe $Script:SystemInfo.VMPlatform)"
+                    } else {
+                        "<span style='background: #28a745; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px;'>Physical</span>"
+                    }
+                )</span></div>
                 <div class="system-info-item"><span class="label">Make / Model</span><span class="value">$(ConvertTo-HtmlSafe "$($Script:SystemInfo.Manufacturer) $($Script:SystemInfo.Model)")</span></div>
                 <div class="system-info-item"><span class="label">Serial Number</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.SerialNumber)</span></div>
                 <div class="system-info-item"><span class="label">Baseboard</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.Baseboard)</span></div>
@@ -5652,6 +5857,14 @@ function New-HtmlReport {
 
     $html += @"
                 <div class="system-info-item"><span class="label">Uptime</span><span class="value">$($Script:SystemInfo.Uptime) &nbsp;(since $($Script:SystemInfo.LastBoot))</span></div>
+"@
+
+    if ($Script:SystemInfo.IsVirtualMachine -and $Script:SystemInfo.VMIndicators.Count -gt 0) {
+        $indicatorHtml = ($Script:SystemInfo.VMIndicators | ForEach-Object { ConvertTo-HtmlSafe $_ }) -join '<br>'
+        $html += "                <div class=`"system-info-item`" style=`"grid-column: 1 / -1;`"><span class=`"label`">VM Detection Indicators</span><span class=`"value`" style=`"font-size: 12px;`">$indicatorHtml</span></div>`n"
+    }
+
+    $html += @"
             </div>
         </div>
 "@
@@ -6232,6 +6445,9 @@ function New-HtmlReport {
             GPUs         = @($Script:SystemInfo.GPUs | ForEach-Object { $_.Name })
             Uptime       = $Script:SystemInfo.Uptime
             LastBoot     = $Script:SystemInfo.LastBoot
+            IsVirtualMachine = $Script:SystemInfo.IsVirtualMachine
+            VMPlatform   = $Script:SystemInfo.VMPlatform
+            VMIndicators = @($Script:SystemInfo.VMIndicators)
         }
         TPM = if ($Script:TPMInfo) {
             [ordered]@{
