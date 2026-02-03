@@ -3962,29 +3962,221 @@ function Test-DMAProtection {
 }
 
 function Test-HotfixStatus {
-    Write-AuditLog "Checking Installed Hotfixes..." -Level "INFO"
+    Write-AuditLog "Checking Patch Installation History..." -Level "INFO"
     
+    $Script:PatchHistory = @()
+    
+    # Source 1: Get-HotFix (WMI Win32_QuickFixEngineering)
     try {
-        $hotfixes = Get-HotFix -ErrorAction Stop | Sort-Object InstalledOn -Descending
-        $recentHotfixes = @($hotfixes | Where-Object { $_.InstalledOn -gt (Get-Date).AddDays(-30) })
-        
-        Add-Finding -Category "Hotfixes" -Name "Installed Hotfixes" -Risk "Info" `
-            -Description "System hotfix inventory" `
-            -Details "Total hotfixes: $($hotfixes.Count)`nRecent (30 days): $($recentHotfixes.Count)`nLast: $(($hotfixes | Select-Object -First 1).HotFixID)"
-        
-        if ($hotfixes.Count -gt 0) {
-            $lastUpdate = ($hotfixes | Select-Object -First 1).InstalledOn
-            if ($lastUpdate -and $lastUpdate -lt (Get-Date).AddDays(-60)) {
-                Add-Finding -Category "Hotfixes" -Name "Stale Hotfix Installation" -Risk "High" `
-                    -Description "No hotfixes installed in the last 60 days" `
-                    -Details "Last hotfix: $lastUpdate" `
-                    -Recommendation "Check Windows Update and apply pending patches"
+        $hotfixes = Get-HotFix -ErrorAction Stop
+        foreach ($hf in $hotfixes) {
+            $installedDate = $null
+            if ($hf.InstalledOn) {
+                try { $installedDate = [DateTime]$hf.InstalledOn } catch { }
+            }
+            
+            $Script:PatchHistory += [PSCustomObject]@{
+                KBArticle    = $hf.HotFixID
+                Title        = $hf.Description
+                InstalledOn  = $installedDate
+                Type         = $hf.Description
+                Result       = "Installed"
+                Source       = "WMI"
+                SupportUrl   = $hf.Caption
+                InstalledBy  = $hf.InstalledBy
             }
         }
     } catch {
-        Add-Finding -Category "Hotfixes" -Name "Hotfix Check Failed" -Risk "Info" `
-            -Description "Could not retrieve hotfix information" `
-            -Details "Error: $_"
+        Write-AuditLog "Get-HotFix failed: $_" -Level "WARN"
+    }
+    
+    # Source 2: Windows Update session history (COM object - much richer data)
+    try {
+        $updateSession = New-Object -ComObject Microsoft.Update.Session -ErrorAction Stop
+        $updateSearcher = $updateSession.CreateUpdateSearcher()
+        $historyCount = $updateSearcher.GetTotalHistoryCount()
+        
+        if ($historyCount -gt 0) {
+            # Cap at 500 to avoid excessive processing
+            $maxRecords = [Math]::Min($historyCount, 500)
+            $history = $updateSearcher.QueryHistory(0, $maxRecords)
+            
+            for ($i = 0; $i -lt $history.Count; $i++) {
+                $entry = $history.Item($i)
+                
+                # Skip null/empty entries
+                if (-not $entry.Title) { continue }
+                
+                # Extract KB number from title
+                $kb = ""
+                if ($entry.Title -match '(KB\d+)') {
+                    $kb = $Matches[1]
+                }
+                
+                $resultCode = switch ($entry.ResultCode) {
+                    0 { "Not Started" }
+                    1 { "In Progress" }
+                    2 { "Succeeded" }
+                    3 { "Succeeded With Errors" }
+                    4 { "Failed" }
+                    5 { "Aborted" }
+                    default { "Unknown ($($entry.ResultCode))" }
+                }
+                
+                $updateType = switch ($entry.Operation) {
+                    1 { "Installation" }
+                    2 { "Uninstallation" }
+                    3 { "Other" }
+                    default { "Unknown" }
+                }
+                
+                # Categorise the update
+                $category = "Other"
+                $title = $entry.Title
+                if ($title -match 'Security|Critical') { $category = "Security" }
+                elseif ($title -match 'Cumulative Update|Feature Update') { $category = "Cumulative" }
+                elseif ($title -match 'Service Stack') { $category = "Servicing Stack" }
+                elseif ($title -match '\.NET Framework') { $category = ".NET" }
+                elseif ($title -match 'Definition Update|Security Intelligence') { $category = "Defender Definitions" }
+                elseif ($title -match 'Driver|driver') { $category = "Driver" }
+                elseif ($title -match 'Malicious Software Removal') { $category = "MSRT" }
+                elseif ($title -match 'Preview') { $category = "Preview" }
+                elseif ($title -match 'Office|Microsoft 365') { $category = "Office" }
+                
+                $installedDate = $null
+                if ($entry.Date) {
+                    try { $installedDate = [DateTime]$entry.Date } catch { }
+                }
+                
+                $Script:PatchHistory += [PSCustomObject]@{
+                    KBArticle    = $kb
+                    Title        = $title
+                    InstalledOn  = $installedDate
+                    Type         = $category
+                    Result       = $resultCode
+                    Source       = "WU-$updateType"
+                    SupportUrl   = if ($entry.SupportUrl) { $entry.SupportUrl } else { "" }
+                    InstalledBy  = ""
+                }
+            }
+        }
+    } catch {
+        Write-AuditLog "Windows Update COM history failed: $_" -Level "WARN"
+    }
+    
+    # Source 3: CBS (Component Based Servicing) log packages for additional data
+    $cbsRegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages"
+    if (Test-Path $cbsRegPath) {
+        try {
+            $cbsPackages = Get-ChildItem -Path $cbsRegPath -ErrorAction SilentlyContinue | 
+                Where-Object { $_.PSChildName -match 'KB\d+' } |
+                Select-Object -First 200
+            
+            foreach ($pkg in $cbsPackages) {
+                $pkgName = $pkg.PSChildName
+                if ($pkgName -match '(KB\d+)') {
+                    $kb = $Matches[1]
+                    # Only add if not already present from other sources
+                    $exists = $Script:PatchHistory | Where-Object { $_.KBArticle -eq $kb -and $_.Source -ne 'CBS' } | Select-Object -First 1
+                    if (-not $exists) {
+                        $installDate = $null
+                        try {
+                            $installClient = Get-ItemProperty -Path $pkg.PSPath -Name "InstallTimeHigh" -ErrorAction SilentlyContinue
+                        } catch { }
+                        
+                        $currentState = Get-ItemProperty -Path $pkg.PSPath -Name "CurrentState" -ErrorAction SilentlyContinue
+                        $stateDesc = switch ($currentState.CurrentState) {
+                            0 { "Absent" }
+                            5 { "Uninstall Pending" }
+                            16 { "Resolving" }
+                            32 { "Resolved" }
+                            48 { "Staging" }
+                            64 { "Staged" }
+                            80 { "Superseded" }
+                            96 { "Install Pending" }
+                            112 { "Installed" }
+                            default { "State $($currentState.CurrentState)" }
+                        }
+                        
+                        $Script:PatchHistory += [PSCustomObject]@{
+                            KBArticle    = $kb
+                            Title        = $pkgName
+                            InstalledOn  = $installDate
+                            Type         = "CBS Package"
+                            Result       = $stateDesc
+                            Source       = "CBS"
+                            SupportUrl   = ""
+                            InstalledBy  = ""
+                        }
+                    }
+                }
+            }
+        } catch {
+            Write-AuditLog "CBS package enumeration failed: $_" -Level "WARN"
+        }
+    }
+    
+    # Deduplicate: prefer WU entries over WMI, prefer entries with dates
+    # Sort priority: WU first, then WMI, then CBS; entries with dates before those without
+    $sortedPatches = $Script:PatchHistory | ForEach-Object {
+        $sourcePriority = if ($_.Source -match '^WU') { 0 } elseif ($_.Source -eq 'WMI') { 1 } else { 2 }
+        $datePriority = if ($_.InstalledOn) { 0 } else { 1 }
+        $_ | Add-Member -NotePropertyName _SrcPri -NotePropertyValue $sourcePriority -PassThru |
+             Add-Member -NotePropertyName _DatePri -NotePropertyValue $datePriority -PassThru
+    } | Sort-Object _SrcPri, _DatePri
+    
+    $deduped = @{}
+    $seenKBs = @{}
+    foreach ($patch in $sortedPatches) {
+        # If we already have this KB from a better source, skip
+        if ($patch.KBArticle -and $seenKBs.ContainsKey($patch.KBArticle)) { continue }
+        
+        $key = "$($patch.KBArticle)|$($patch.Title)|$($patch.Source)"
+        if (-not $deduped.ContainsKey($key)) {
+            $deduped[$key] = $patch
+            if ($patch.KBArticle) { $seenKBs[$patch.KBArticle] = $true }
+        }
+    }
+    $Script:PatchHistory = @($deduped.Values | Sort-Object InstalledOn -Descending)
+    
+    # Generate findings
+    $totalPatches = $Script:PatchHistory.Count
+    $successPatches = @($Script:PatchHistory | Where-Object { $_.Result -match 'Succeeded|Installed' }).Count
+    $failedPatches = @($Script:PatchHistory | Where-Object { $_.Result -eq 'Failed' })
+    $securityPatches = @($Script:PatchHistory | Where-Object { $_.Type -eq 'Security' -and $_.Result -match 'Succeeded|Installed' }).Count
+    
+    # Find most recent successful non-definition patch
+    $recentNonDef = $Script:PatchHistory | Where-Object { 
+        $_.InstalledOn -and $_.Result -match 'Succeeded|Installed' -and $_.Type -notin @('Defender Definitions', 'MSRT') 
+    } | Select-Object -First 1
+    
+    $daysSincePatch = if ($recentNonDef -and $recentNonDef.InstalledOn) { 
+        ((Get-Date) - $recentNonDef.InstalledOn).Days 
+    } else { $null }
+    
+    Add-Finding -Category "Patch History" -Name "Patch Installation Summary" -Risk "Info" `
+        -Description "Windows Update installation history" `
+        -Details "Total records: $totalPatches`nSuccessful: $successPatches`nSecurity patches: $securityPatches$(if ($daysSincePatch -ne $null) { "`nDays since last non-definition patch: $daysSincePatch" })"
+    
+    if ($failedPatches.Count -gt 0) {
+        $failedList = ($failedPatches | Select-Object -First 10 | ForEach-Object { 
+            "$($_.KBArticle) - $($_.Title)" -replace '(.{80}).+', '$1...'
+        }) -join "`n"
+        
+        $risk = if ($failedPatches.Count -ge 5) { "High" } else { "Medium" }
+        Add-Finding -Category "Patch History" -Name "Failed Update Installations" -Risk $risk `
+            -Description "$($failedPatches.Count) Windows Updates failed to install" `
+            -Details "Failed updates (first 10):`n$failedList" `
+            -Recommendation "Investigate and resolve failed Windows Update installations" `
+            -Reference "Cyber Essentials: Patch Management"
+    }
+    
+    if ($daysSincePatch -and $daysSincePatch -gt 60) {
+        Add-Finding -Category "Patch History" -Name "Stale Patch Installation" -Risk "High" `
+            -Description "No non-definition patches installed in $daysSincePatch days" `
+            -Details "Last patch: $($recentNonDef.KBArticle) on $($recentNonDef.InstalledOn.ToString('yyyy-MM-dd'))" `
+            -Recommendation "Check Windows Update and apply pending patches" `
+            -Reference "Cyber Essentials: Patch Management"
     }
 }
 
@@ -4845,6 +5037,11 @@ function New-HtmlReport {
         $html += "                <li><a href='#vscode-extensions'>VS Code Extensions ($($Script:VSCodeExtensions.Count))</a></li>`n"
     }
     
+    # Add Patch History link
+    if ($Script:PatchHistory -and $Script:PatchHistory.Count -gt 0) {
+        $html += "                <li><a href='#patch-history'>Patch History ($($Script:PatchHistory.Count))</a></li>`n"
+    }
+    
     $adminStatusHtml = if ($Script:SystemInfo.IsAdmin) {
         "<span style='color: #28a745; font-weight: bold;'>[OK] Yes</span>"
     } else {
@@ -5181,6 +5378,151 @@ function New-HtmlReport {
 "@
     }
     
+    # Add Patch History Section
+    if ($Script:PatchHistory -and $Script:PatchHistory.Count -gt 0) {
+        $successCount = @($Script:PatchHistory | Where-Object { $_.Result -match 'Succeeded|Installed' }).Count
+        $failCount = @($Script:PatchHistory | Where-Object { $_.Result -eq 'Failed' }).Count
+        
+        # Get unique categories
+        $patchTypes = $Script:PatchHistory | Select-Object -ExpandProperty Type -Unique | Sort-Object
+        
+        $html += @"
+        
+        <div class="browser-extensions" id="patch-history">
+            <h3>Patch Installation History ($($Script:PatchHistory.Count) records)
+                <span style="font-size: 13px; font-weight: normal; margin-left: 10px;">
+                    <span class="ext-badge" style="background: #28a745; color: white;">Installed: $successCount</span>
+                    $(if ($failCount -gt 0) { "<span class='ext-badge' style='background: #dc3545; color: white;'>Failed: $failCount</span>" })
+                </span>
+            </h3>
+            <div class="inventory-filter">
+                <input type="text" id="patchSearch" placeholder="Search patches (KB, title)..." onkeyup="filterPatches()">
+                <select id="patchTypeFilter" onchange="filterPatches()">
+                    <option value="">All Types</option>
+"@
+        foreach ($pt in $patchTypes) {
+            $html += "                    <option value=`"$pt`">$pt</option>`n"
+        }
+        
+        $html += @"
+                </select>
+                <select id="patchResultFilter" onchange="filterPatches()">
+                    <option value="">All Results</option>
+                    <option value="success">Succeeded/Installed</option>
+                    <option value="failed">Failed</option>
+                </select>
+                <select id="patchAgeFilter" onchange="filterPatches()">
+                    <option value="">All Dates</option>
+                    <option value="30">Last 30 Days</option>
+                    <option value="90">Last 90 Days</option>
+                    <option value="180">Last 6 Months</option>
+                    <option value="365">Last Year</option>
+                </select>
+            </div>
+            <div class="inventory-wrapper" style="max-height: 500px;">
+                <table class="inventory-table" id="patchTable">
+                    <thead>
+                        <tr>
+                            <th>KB Article</th>
+                            <th>Title</th>
+                            <th>Date Installed</th>
+                            <th>Type</th>
+                            <th>Result</th>
+                            <th>Source</th>
+                            <th>Installed By</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+        
+        foreach ($patch in $Script:PatchHistory) {
+            $dateStr = if ($patch.InstalledOn) { $patch.InstalledOn.ToString('yyyy-MM-dd HH:mm') } else { "Unknown" }
+            $dateIso = if ($patch.InstalledOn) { $patch.InstalledOn.ToString('yyyy-MM-dd') } else { "" }
+            $resultClass = if ($patch.Result -eq 'Failed') { 
+                "style='background: #f8d7da;'" 
+            } elseif ($patch.Result -match 'Succeeded|Installed') { 
+                "" 
+            } else { 
+                "style='background: #fff3cd;'" 
+            }
+            $resultBadge = if ($patch.Result -eq 'Failed') {
+                "<span class='ext-badge' style='background: #dc3545; color: white;'>Failed</span>"
+            } elseif ($patch.Result -match 'Succeeded|Installed') {
+                "<span class='ext-badge' style='background: #28a745; color: white;'>$($patch.Result)</span>"
+            } else {
+                "<span class='ext-badge' style='background: #ffc107; color: #333;'>$($patch.Result)</span>"
+            }
+            
+            $titleDisplay = ConvertTo-HtmlSafe $patch.Title
+            if ($titleDisplay.Length -gt 100) { $titleDisplay = $titleDisplay.Substring(0, 100) + "..." }
+            
+            $kbLink = if ($patch.KBArticle -and $patch.KBArticle -match 'KB\d+') {
+                "<a href='https://support.microsoft.com/help/$($patch.KBArticle -replace 'KB','')' target='_blank' style='color: #0078d4;'>$($patch.KBArticle)</a>"
+            } else { 
+                ConvertTo-HtmlSafe $patch.KBArticle 
+            }
+            
+            $html += @"
+                        <tr $resultClass data-type="$($patch.Type)" data-result="$($patch.Result)" data-date="$dateIso">
+                            <td style="white-space: nowrap;">$kbLink</td>
+                            <td>$titleDisplay</td>
+                            <td style="white-space: nowrap;">$dateStr</td>
+                            <td><span class="ext-badge user">$($patch.Type)</span></td>
+                            <td>$resultBadge</td>
+                            <td style="font-size: 11px;">$(ConvertTo-HtmlSafe $patch.Source)</td>
+                            <td style="font-size: 11px;">$(ConvertTo-HtmlSafe $patch.InstalledBy)</td>
+                        </tr>
+"@
+        }
+        
+        $html += @"
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <script>
+        function filterPatches() {
+            var searchText = document.getElementById('patchSearch').value.toLowerCase();
+            var typeFilter = document.getElementById('patchTypeFilter').value;
+            var resultFilter = document.getElementById('patchResultFilter').value;
+            var ageFilter = document.getElementById('patchAgeFilter').value;
+            var rows = document.querySelectorAll('#patchTable tbody tr');
+            
+            var cutoffDate = null;
+            if (ageFilter) {
+                cutoffDate = new Date();
+                cutoffDate.setDate(cutoffDate.getDate() - parseInt(ageFilter));
+            }
+            
+            rows.forEach(function(row) {
+                var text = row.textContent.toLowerCase();
+                var type = row.getAttribute('data-type');
+                var result = row.getAttribute('data-result');
+                var dateStr = row.getAttribute('data-date');
+                
+                var matchesSearch = text.includes(searchText);
+                var matchesType = !typeFilter || type === typeFilter;
+                
+                var matchesResult = true;
+                if (resultFilter === 'success') { matchesResult = /Succeeded|Installed/.test(result); }
+                else if (resultFilter === 'failed') { matchesResult = result === 'Failed'; }
+                
+                var matchesAge = true;
+                if (cutoffDate && dateStr) {
+                    var rowDate = new Date(dateStr);
+                    matchesAge = rowDate >= cutoffDate;
+                } else if (cutoffDate && !dateStr) {
+                    matchesAge = false;
+                }
+                
+                row.style.display = (matchesSearch && matchesType && matchesResult && matchesAge) ? '' : 'none';
+            });
+        }
+        </script>
+"@
+    }
+    
     # Add findings by category
     foreach ($cat in $categories) {
         $catId = $cat -replace '\s+', '-' -replace '[^\w-]', ''
@@ -5267,6 +5609,7 @@ function New-HtmlReport {
         SoftwareInventory = @()
         BrowserExtensions = @()
         VSCodeExtensions  = @()
+        PatchHistory      = @()
     }
 
     if ($Script:CyberEssentials) {
@@ -5321,6 +5664,20 @@ function New-HtmlReport {
                 Version     = $_.Version
                 ExtensionId = $_.ExtensionId
                 InstallType = $_.InstallType
+            }
+        })
+    }
+
+    if ($Script:PatchHistory) {
+        $jsonExport['PatchHistory'] = @($Script:PatchHistory | ForEach-Object {
+            [ordered]@{
+                KBArticle   = $_.KBArticle
+                Title       = $_.Title
+                InstalledOn = if ($_.InstalledOn) { $_.InstalledOn.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+                Type        = $_.Type
+                Result      = $_.Result
+                Source      = $_.Source
+                InstalledBy = $_.InstalledBy
             }
         })
     }
@@ -5426,6 +5783,7 @@ function Export-JsonReport {
         SoftwareInventory = @()
         BrowserExtensions = @()
         VSCodeExtensions  = @()
+        PatchHistory      = @()
     }
     
     # Add Cyber Essentials if available
@@ -5491,6 +5849,21 @@ function Export-JsonReport {
                 Categories  = $_.Categories
                 ExtensionId = $_.ExtensionId
                 InstallType = $_.InstallType
+            }
+        })
+    }
+    
+    # Add Patch History
+    if ($Script:PatchHistory) {
+        $exportData['PatchHistory'] = @($Script:PatchHistory | ForEach-Object {
+            [ordered]@{
+                KBArticle   = $_.KBArticle
+                Title       = $_.Title
+                InstalledOn = if ($_.InstalledOn) { $_.InstalledOn.ToString('yyyy-MM-dd HH:mm:ss') } else { $null }
+                Type        = $_.Type
+                Result      = $_.Result
+                Source      = $_.Source
+                InstalledBy = $_.InstalledBy
             }
         })
     }
