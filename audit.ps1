@@ -3201,6 +3201,556 @@ function Test-BrowserSecurity {
                 -Recommendation "Enable automatic updates for security patches"
         }
     }
+    
+    # Enumerate browser extensions across all user profiles
+    Get-BrowserExtensions
+}
+
+function Get-BrowserExtensions {
+    Write-AuditLog "Enumerating Browser Extensions..." -Level "INFO"
+    
+    $Script:BrowserExtensions = @()
+    
+    # Get all user profile directories
+    $usersDir = "$env:SystemDrive\Users"
+    $userProfiles = @()
+    
+    try {
+        $userProfiles = Get-ChildItem -Path $usersDir -Directory -ErrorAction Stop | 
+            Where-Object { $_.Name -notin @('Public', 'Default', 'Default User', 'All Users') }
+    } catch {
+        Write-AuditLog "Could not enumerate user profiles: $_" -Level "WARN"
+        return
+    }
+    
+    foreach ($profile in $userProfiles) {
+        $userName = $profile.Name
+        $profilePath = $profile.FullName
+        
+        # --- GOOGLE CHROME ---
+        $chromeExtPath = Join-Path $profilePath "AppData\Local\Google\Chrome\User Data"
+        if (Test-Path $chromeExtPath) {
+            # Chrome can have multiple profiles (Default, Profile 1, Profile 2, etc.)
+            $chromeProfiles = @()
+            $defaultProfile = Join-Path $chromeExtPath "Default"
+            if (Test-Path $defaultProfile) { $chromeProfiles += $defaultProfile }
+            
+            Get-ChildItem -Path $chromeExtPath -Directory -Filter "Profile *" -ErrorAction SilentlyContinue | 
+                ForEach-Object { $chromeProfiles += $_.FullName }
+            
+            foreach ($cp in $chromeProfiles) {
+                $cpName = Split-Path $cp -Leaf
+                $extDir = Join-Path $cp "Extensions"
+                if (Test-Path $extDir) {
+                    Get-ChildItem -Path $extDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                        $extId = $_.Name
+                        $extInfo = Get-ChromiumExtensionInfo -ExtensionPath $_.FullName -ExtensionId $extId
+                        if ($extInfo) {
+                            $Script:BrowserExtensions += [PSCustomObject]@{
+                                Browser        = "Chrome"
+                                UserProfile    = $userName
+                                BrowserProfile = $cpName
+                                ExtensionId    = $extId
+                                Name           = $extInfo.Name
+                                Version        = $extInfo.Version
+                                Description    = $extInfo.Description
+                                Enabled        = $extInfo.Enabled
+                                InstallType    = $extInfo.InstallType
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        # --- MICROSOFT EDGE ---
+        $edgeExtPath = Join-Path $profilePath "AppData\Local\Microsoft\Edge\User Data"
+        if (Test-Path $edgeExtPath) {
+            $edgeProfiles = @()
+            $defaultProfile = Join-Path $edgeExtPath "Default"
+            if (Test-Path $defaultProfile) { $edgeProfiles += $defaultProfile }
+            
+            Get-ChildItem -Path $edgeExtPath -Directory -Filter "Profile *" -ErrorAction SilentlyContinue | 
+                ForEach-Object { $edgeProfiles += $_.FullName }
+            
+            foreach ($ep in $edgeProfiles) {
+                $epName = Split-Path $ep -Leaf
+                $extDir = Join-Path $ep "Extensions"
+                if (Test-Path $extDir) {
+                    Get-ChildItem -Path $extDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                        $extId = $_.Name
+                        $extInfo = Get-ChromiumExtensionInfo -ExtensionPath $_.FullName -ExtensionId $extId
+                        if ($extInfo) {
+                            $Script:BrowserExtensions += [PSCustomObject]@{
+                                Browser        = "Edge"
+                                UserProfile    = $userName
+                                BrowserProfile = $epName
+                                ExtensionId    = $extId
+                                Name           = $extInfo.Name
+                                Version        = $extInfo.Version
+                                Description    = $extInfo.Description
+                                Enabled        = $extInfo.Enabled
+                                InstallType    = $extInfo.InstallType
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        # --- MOZILLA FIREFOX ---
+        $firefoxProfilesPath = Join-Path $profilePath "AppData\Roaming\Mozilla\Firefox\Profiles"
+        if (Test-Path $firefoxProfilesPath) {
+            Get-ChildItem -Path $firefoxProfilesPath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $ffProfileName = $_.Name
+                $ffProfilePath = $_.FullName
+                
+                # Firefox stores extensions in extensions.json
+                $extensionsJson = Join-Path $ffProfilePath "extensions.json"
+                if (Test-Path $extensionsJson) {
+                    try {
+                        $ffData = Get-Content -Path $extensionsJson -Raw -ErrorAction Stop | ConvertFrom-Json
+                        
+                        if ($ffData.addons) {
+                            foreach ($addon in $ffData.addons) {
+                                # Skip system/built-in addons and language packs
+                                if ($addon.location -eq 'app-system-defaults' -or 
+                                    $addon.location -eq 'app-builtin' -or
+                                    $addon.type -eq 'locale' -or
+                                    $addon.type -eq 'dictionary' -or
+                                    ($addon.id -and $addon.id -match '^(langpack-|default-theme@|firefox-compact-)')) {
+                                    continue
+                                }
+                                
+                                $ffEnabled = -not $addon.userDisabled -and $addon.active
+                                $ffInstallType = switch ($addon.location) {
+                                    'app-profile' { 'User' }
+                                    'app-system-share' { 'System' }
+                                    'app-global' { 'Policy' }
+                                    default { $addon.location }
+                                }
+                                
+                                $Script:BrowserExtensions += [PSCustomObject]@{
+                                    Browser        = "Firefox"
+                                    UserProfile    = $userName
+                                    BrowserProfile = $ffProfileName
+                                    ExtensionId    = $addon.id
+                                    Name           = $addon.defaultLocale.name
+                                    Version        = $addon.version
+                                    Description    = if ($addon.defaultLocale.description) { 
+                                                        $addon.defaultLocale.description.Substring(0, [Math]::Min(150, $addon.defaultLocale.description.Length))
+                                                     } else { "" }
+                                    Enabled        = $ffEnabled
+                                    InstallType    = $ffInstallType
+                                }
+                            }
+                        }
+                    } catch {
+                        Write-AuditLog "Could not parse Firefox extensions for $userName/$ffProfileName : $_" -Level "WARN"
+                    }
+                }
+                
+                # Also check addons.json as a fallback for name resolution
+                $addonsJson = Join-Path $ffProfilePath "addons.json"
+                if ((Test-Path $addonsJson) -and -not (Test-Path $extensionsJson)) {
+                    try {
+                        $addonsData = Get-Content -Path $addonsJson -Raw -ErrorAction Stop | ConvertFrom-Json
+                        if ($addonsData.addons) {
+                            foreach ($addon in $addonsData.addons) {
+                                if ($addon.type -ne 'extension') { continue }
+                                
+                                $Script:BrowserExtensions += [PSCustomObject]@{
+                                    Browser        = "Firefox"
+                                    UserProfile    = $userName
+                                    BrowserProfile = $ffProfileName
+                                    ExtensionId    = $addon.id
+                                    Name           = $addon.name
+                                    Version        = $addon.version
+                                    Description    = ""
+                                    Enabled        = $true
+                                    InstallType    = "User"
+                                }
+                            }
+                        }
+                    } catch { }
+                }
+            }
+        }
+    }
+    
+    # Also check for policy-forced extensions (machine-wide)
+    Get-PolicyForcedExtensions
+    
+    # Sort and report
+    $Script:BrowserExtensions = $Script:BrowserExtensions | Sort-Object Browser, UserProfile, Name
+    
+    $totalExt = $Script:BrowserExtensions.Count
+    $chromeCount = @($Script:BrowserExtensions | Where-Object { $_.Browser -eq 'Chrome' }).Count
+    $edgeCount = @($Script:BrowserExtensions | Where-Object { $_.Browser -eq 'Edge' }).Count
+    $firefoxCount = @($Script:BrowserExtensions | Where-Object { $_.Browser -eq 'Firefox' }).Count
+    
+    if ($totalExt -gt 0) {
+        Add-Finding -Category "Browser Security" -Name "Browser Extensions Inventory" -Risk "Info" `
+            -Description "Enumerated $totalExt browser extensions across all user profiles" `
+            -Details "Chrome: $chromeCount, Edge: $edgeCount, Firefox: $firefoxCount"
+    } else {
+        Add-Finding -Category "Browser Security" -Name "Browser Extensions" -Risk "Info" `
+            -Description "No browser extensions found or could not access browser profiles" `
+            -Details "This may require running as admin to access all user profiles"
+    }
+}
+
+function Get-ChromiumExtensionInfo {
+    param(
+        [string]$ExtensionPath,
+        [string]$ExtensionId
+    )
+    
+    # Skip the Temp directory
+    if ($ExtensionId -eq 'Temp') { return $null }
+    
+    try {
+        # Get the latest version folder
+        $versionDirs = Get-ChildItem -Path $ExtensionPath -Directory -ErrorAction SilentlyContinue | 
+            Sort-Object Name -Descending
+        
+        if (-not $versionDirs) { return $null }
+        
+        $latestVersion = $versionDirs[0]
+        $manifestFile = Join-Path $latestVersion.FullName "manifest.json"
+        
+        if (-not (Test-Path $manifestFile)) { return $null }
+        
+        $manifest = Get-Content -Path $manifestFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        
+        # Get extension name - may be a locale key like "__MSG_appName__"
+        $extName = $manifest.name
+        if ($extName -match '^__MSG_(.+)__$') {
+            $msgKey = $Matches[1]
+            # Try to resolve from _locales/en/messages.json
+            $localeFile = Join-Path $latestVersion.FullName "_locales\en\messages.json"
+            if (-not (Test-Path $localeFile)) {
+                $localeFile = Join-Path $latestVersion.FullName "_locales\en_US\messages.json"
+            }
+            if (Test-Path $localeFile) {
+                try {
+                    $messages = Get-Content -Path $localeFile -Raw -ErrorAction Stop | ConvertFrom-Json
+                    if ($messages.$msgKey.message) {
+                        $extName = $messages.$msgKey.message
+                    }
+                } catch { }
+            }
+        }
+        
+        # Skip Chrome internal extensions
+        if (-not $extName -or $extName -match '^__MSG_') { 
+            # Use folder name or ID as fallback
+            $extName = "[ID: $ExtensionId]"
+        }
+        
+        $extDescription = ""
+        if ($manifest.description) {
+            $desc = $manifest.description
+            if ($desc -notmatch '^__MSG_') {
+                $extDescription = $desc.Substring(0, [Math]::Min(150, $desc.Length))
+            }
+        }
+        
+        # Determine install type
+        $installType = "User"
+        
+        # Check Preferences/Secure Preferences for state (simplified)
+        $enabled = $true
+        
+        return @{
+            Name        = $extName
+            Version     = $manifest.version
+            Description = $extDescription
+            Enabled     = $enabled
+            InstallType = $installType
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Get-PolicyForcedExtensions {
+    # Check for GPO/policy-forced extensions
+    
+    # Chrome force-installed extensions
+    $chromeForceInstall = "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist"
+    if (Test-Path $chromeForceInstall) {
+        try {
+            $props = Get-ItemProperty -Path $chromeForceInstall -ErrorAction Stop
+            $props.PSObject.Properties | Where-Object { $_.Name -match '^\d+$' } | ForEach-Object {
+                $value = $_.Value
+                $extId = ($value -split ';')[0]
+                
+                $Script:BrowserExtensions += [PSCustomObject]@{
+                    Browser        = "Chrome"
+                    UserProfile    = "POLICY"
+                    BrowserProfile = "GPO"
+                    ExtensionId    = $extId
+                    Name           = "[Policy Forced: $extId]"
+                    Version        = "N/A"
+                    Description    = "Force-installed via Group Policy"
+                    Enabled        = $true
+                    InstallType    = "Policy"
+                }
+            }
+        } catch { }
+    }
+    
+    # Edge force-installed extensions
+    $edgeForceInstall = "HKLM:\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist"
+    if (Test-Path $edgeForceInstall) {
+        try {
+            $props = Get-ItemProperty -Path $edgeForceInstall -ErrorAction Stop
+            $props.PSObject.Properties | Where-Object { $_.Name -match '^\d+$' } | ForEach-Object {
+                $value = $_.Value
+                $extId = ($value -split ';')[0]
+                
+                $Script:BrowserExtensions += [PSCustomObject]@{
+                    Browser        = "Edge"
+                    UserProfile    = "POLICY"
+                    BrowserProfile = "GPO"
+                    ExtensionId    = $extId
+                    Name           = "[Policy Forced: $extId]"
+                    Version        = "N/A"
+                    Description    = "Force-installed via Group Policy"
+                    Enabled        = $true
+                    InstallType    = "Policy"
+                }
+            }
+        } catch { }
+    }
+    
+    # Check for blocked extensions policy
+    $chromeBlockList = "HKLM:\SOFTWARE\Policies\Google\Chrome\ExtensionInstallBlocklist"
+    if (Test-Path $chromeBlockList) {
+        try {
+            $props = Get-ItemProperty -Path $chromeBlockList -ErrorAction Stop
+            $blockAll = $props.PSObject.Properties | Where-Object { $_.Value -eq '*' }
+            if ($blockAll) {
+                Add-Finding -Category "Browser Security" -Name "Chrome Extension Allowlist Mode" -Risk "Info" `
+                    -Description "Chrome is configured to block all extensions except those explicitly allowed" `
+                    -Details "ExtensionInstallBlocklist contains '*' (block all)"
+            }
+        } catch { }
+    }
+    
+    $edgeBlockList = "HKLM:\SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallBlocklist"
+    if (Test-Path $edgeBlockList) {
+        try {
+            $props = Get-ItemProperty -Path $edgeBlockList -ErrorAction Stop
+            $blockAll = $props.PSObject.Properties | Where-Object { $_.Value -eq '*' }
+            if ($blockAll) {
+                Add-Finding -Category "Browser Security" -Name "Edge Extension Allowlist Mode" -Risk "Info" `
+                    -Description "Edge is configured to block all extensions except those explicitly allowed" `
+                    -Details "ExtensionInstallBlocklist contains '*' (block all)"
+            }
+        } catch { }
+    }
+}
+
+function Get-VSCodeExtensions {
+    Write-AuditLog "Enumerating VS Code Extensions..." -Level "INFO"
+    
+    $Script:VSCodeExtensions = @()
+    
+    $usersDir = "$env:SystemDrive\Users"
+    $userProfiles = @()
+    
+    try {
+        $userProfiles = Get-ChildItem -Path $usersDir -Directory -ErrorAction Stop | 
+            Where-Object { $_.Name -notin @('Public', 'Default', 'Default User', 'All Users') }
+    } catch {
+        Write-AuditLog "Could not enumerate user profiles for VS Code: $_" -Level "WARN"
+        return
+    }
+    
+    # VSCode variants and their extension paths
+    $vsCodeVariants = @(
+        @{ Name = "VS Code";         ExtDir = ".vscode\extensions" }
+        @{ Name = "VS Code Insiders"; ExtDir = ".vscode-insiders\extensions" }
+        @{ Name = "VSCodium";         ExtDir = ".vscode-oss\extensions" }
+        @{ Name = "Cursor";           ExtDir = ".cursor\extensions" }
+    )
+    
+    foreach ($profile in $userProfiles) {
+        $userName = $profile.Name
+        $profilePath = $profile.FullName
+        
+        foreach ($variant in $vsCodeVariants) {
+            $extensionsDir = Join-Path $profilePath $variant.ExtDir
+            
+            if (-not (Test-Path $extensionsDir)) { continue }
+            
+            try {
+                $extFolders = Get-ChildItem -Path $extensionsDir -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -ne '.obsolete' -and $_.Name -ne '.init-default-profile-extensions' }
+                
+                foreach ($extFolder in $extFolders) {
+                    $packageJson = Join-Path $extFolder.FullName "package.json"
+                    
+                    $extName = $extFolder.Name
+                    $extPublisher = ""
+                    $extVersion = ""
+                    $extDescription = ""
+                    $extCategories = ""
+                    
+                    if (Test-Path $packageJson) {
+                        try {
+                            $pkg = Get-Content -Path $packageJson -Raw -ErrorAction Stop | ConvertFrom-Json
+                            
+                            if ($pkg.displayName) { $extName = $pkg.displayName }
+                            elseif ($pkg.name) { $extName = $pkg.name }
+                            
+                            $extPublisher = if ($pkg.publisher) { $pkg.publisher } else { "" }
+                            $extVersion = if ($pkg.version) { $pkg.version } else { "" }
+                            
+                            if ($pkg.description) {
+                                $extDescription = $pkg.description
+                                if ($extDescription.Length -gt 120) {
+                                    $extDescription = $extDescription.Substring(0, 120) + "..."
+                                }
+                            }
+                            
+                            if ($pkg.categories) {
+                                $extCategories = ($pkg.categories -join ", ")
+                            }
+                        } catch {
+                            # Could not parse package.json, use folder name
+                        }
+                    }
+                    
+                    # Parse publisher.name-version from folder name as fallback
+                    if (-not $extPublisher -and $extFolder.Name -match '^([^.]+)\.(.+)-(\d+\.\d+.*)$') {
+                        $extPublisher = $Matches[1]
+                        if (-not $extName -or $extName -eq $extFolder.Name) { $extName = $Matches[2] }
+                        if (-not $extVersion) { $extVersion = $Matches[3] }
+                    }
+                    
+                    # Build extension identifier
+                    $extId = if ($extPublisher) { "$extPublisher.$($extFolder.Name -replace '^[^.]+\.' -replace '-[\d\.]+$')" } else { $extFolder.Name }
+                    
+                    $Script:VSCodeExtensions += [PSCustomObject]@{
+                        Editor      = $variant.Name
+                        UserProfile = $userName
+                        FolderName  = $extFolder.Name
+                        Name        = $extName
+                        Publisher   = $extPublisher
+                        Version     = $extVersion
+                        Description = $extDescription
+                        Categories  = $extCategories
+                        ExtensionId = $extId
+                        InstallType = "User"
+                    }
+                }
+            } catch {
+                Write-AuditLog "Error reading VS Code extensions at $extensionsDir : $_" -Level "WARN"
+            }
+        }
+    }
+    
+    # Check machine-wide installations
+    $machineWidePaths = @(
+        @{ Path = "$env:ProgramFiles\Microsoft VS Code\resources\app\extensions"; Name = "VS Code"; Label = "Built-in" }
+        @{ Path = "${env:ProgramFiles(x86)}\Microsoft VS Code\resources\app\extensions"; Name = "VS Code (x86)"; Label = "Built-in" }
+        @{ Path = "$env:ProgramFiles\Microsoft VS Code Insiders\resources\app\extensions"; Name = "VS Code Insiders"; Label = "Built-in" }
+    )
+    
+    foreach ($mw in $machineWidePaths) {
+        if (-not (Test-Path $mw.Path)) { continue }
+        
+        try {
+            $extFolders = Get-ChildItem -Path $mw.Path -Directory -ErrorAction SilentlyContinue
+            
+            foreach ($extFolder in $extFolders) {
+                $packageJson = Join-Path $extFolder.FullName "package.json"
+                
+                $extName = $extFolder.Name
+                $extPublisher = "Microsoft"
+                $extVersion = ""
+                $extDescription = ""
+                $extCategories = ""
+                
+                if (Test-Path $packageJson) {
+                    try {
+                        $pkg = Get-Content -Path $packageJson -Raw -ErrorAction Stop | ConvertFrom-Json
+                        
+                        if ($pkg.displayName) { $extName = $pkg.displayName }
+                        elseif ($pkg.name) { $extName = $pkg.name }
+                        if ($pkg.publisher) { $extPublisher = $pkg.publisher }
+                        if ($pkg.version) { $extVersion = $pkg.version }
+                        if ($pkg.description) {
+                            $extDescription = $pkg.description
+                            if ($extDescription.Length -gt 120) {
+                                $extDescription = $extDescription.Substring(0, 120) + "..."
+                            }
+                        }
+                        if ($pkg.categories) { $extCategories = ($pkg.categories -join ", ") }
+                    } catch { }
+                }
+                
+                $Script:VSCodeExtensions += [PSCustomObject]@{
+                    Editor      = $mw.Name
+                    UserProfile = "MACHINE"
+                    FolderName  = $extFolder.Name
+                    Name        = $extName
+                    Publisher   = $extPublisher
+                    Version     = $extVersion
+                    Description = $extDescription
+                    Categories  = $extCategories
+                    ExtensionId = "$extPublisher.$($extFolder.Name)"
+                    InstallType = $mw.Label
+                }
+            }
+        } catch { }
+    }
+    
+    # Check for policy-managed extensions via registry
+    $vscodePolicyPath = "HKLM:\SOFTWARE\Policies\Microsoft\VSCode"
+    if (Test-Path $vscodePolicyPath) {
+        Add-Finding -Category "Application Security" -Name "VS Code Managed by Policy" -Risk "Info" `
+            -Description "VS Code has Group Policy settings configured" `
+            -Details "Policy path exists: $vscodePolicyPath"
+    }
+    
+    # Sort results
+    $Script:VSCodeExtensions = $Script:VSCodeExtensions | Sort-Object Editor, UserProfile, Name
+    
+    # Report findings
+    $totalVSExt = $Script:VSCodeExtensions.Count
+    $userInstalled = @($Script:VSCodeExtensions | Where-Object { $_.InstallType -eq 'User' }).Count
+    $builtIn = @($Script:VSCodeExtensions | Where-Object { $_.InstallType -eq 'Built-in' }).Count
+    
+    if ($totalVSExt -gt 0) {
+        # Check for potentially risky extensions
+        $riskyPatterns = @(
+            @{ Pattern = 'remote-ssh'; Risk = "Info"; Desc = "Enables remote SSH connections" }
+            @{ Pattern = 'remote-tunnel'; Risk = "Info"; Desc = "Enables remote tunnel access" }
+            @{ Pattern = 'live-share'; Risk = "Info"; Desc = "Enables live collaboration/sharing" }
+            @{ Pattern = 'code-runner'; Risk = "Low"; Desc = "Can execute arbitrary code" }
+            @{ Pattern = 'shell-launcher'; Risk = "Low"; Desc = "Can launch shell processes" }
+        )
+        
+        foreach ($risky in $riskyPatterns) {
+            $found = @($Script:VSCodeExtensions | Where-Object { 
+                $_.FolderName -match $risky.Pattern -or $_.ExtensionId -match $risky.Pattern 
+            })
+            foreach ($f in $found) {
+                Add-Finding -Category "Application Security" -Name "VS Code Extension: $($f.Name)" -Risk $risky.Risk `
+                    -Description "$($risky.Desc) - verify if authorized" `
+                    -Details "User: $($f.UserProfile), Extension: $($f.ExtensionId) v$($f.Version)" `
+                    -Recommendation "Review if this VS Code extension is required and authorized"
+            }
+        }
+        
+        Add-Finding -Category "Application Security" -Name "VS Code Extensions Inventory" -Risk "Info" `
+            -Description "Enumerated $totalVSExt VS Code extensions across all profiles" `
+            -Details "User-installed: $userInstalled, Built-in: $builtIn"
+    }
 }
 
 function Test-DNSSecurity {
@@ -4053,6 +4603,35 @@ function New-HtmlReport {
             font-size: 13px;
         }
         
+        .browser-extensions {
+            background: var(--bg-secondary);
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        }
+        
+        .browser-extensions h3 {
+            font-size: 18px;
+            margin-bottom: 16px;
+            color: #1e3a5f;
+        }
+        
+        .ext-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        
+        .ext-badge.chrome { background: #4285f4; color: white; }
+        .ext-badge.edge { background: #0078d4; color: white; }
+        .ext-badge.firefox { background: #ff7139; color: white; }
+        .ext-badge.policy { background: #6c757d; color: white; }
+        .ext-badge.user { background: #e9ecef; color: #495057; }
+        .ext-badge.disabled { background: #f8d7da; color: #721c24; }
+        
         .footer {
             text-align: center;
             padding: 20px;
@@ -4112,7 +4691,7 @@ function New-HtmlReport {
     <div class="container">
         <header class="header">
             <div>
-                <h1>Windows Security Audit Report</h1>
+                <h1> Windows Security Audit Report</h1>
                 <div class="header-meta">
                     <div><strong>Hostname:</strong> $($Script:SystemInfo.Hostname)</div>
                     <div><strong>Audit Date:</strong> $($Script:AuditDate)</div>
@@ -4197,34 +4776,34 @@ function New-HtmlReport {
     
     $html += @"
         <div class="cyber-essentials">
-            <h3>CYBER ESSENTIALS Assessment Summary <span style="float: right; font-size: 14px; color: $ceScoreColor;">Readiness Score: $($Script:CyberEssentialsScore)%</span></h3>
+            <h3> Cyber Essentials Assessment Summary <span style="float: right; font-size: 14px; color: $ceScoreColor;">Readiness Score: $($Script:CyberEssentialsScore)%</span></h3>
             <div class="ce-grid">
                 <div class="ce-item $ceFirewallClass">
-                    <h4>FIREWALLS <span class="ce-status $ceFirewallClass">$($Script:CyberEssentials.Firewalls.Status)</span></h4>
+                    <h4> Firewalls <span class="ce-status $ceFirewallClass">$($Script:CyberEssentials.Firewalls.Status)</span></h4>
                     <div class="ce-details">
                         $($Script:CyberEssentials.Firewalls.Details | ForEach-Object { "<div>$_</div>" })
                     </div>
                 </div>
                 <div class="ce-item $ceSecConfigClass">
-                    <h4>SECURE CONFIG <span class="ce-status $ceSecConfigClass">$($Script:CyberEssentials.SecureConfiguration.Status)</span></h4>
+                    <h4> Secure Configuration <span class="ce-status $ceSecConfigClass">$($Script:CyberEssentials.SecureConfiguration.Status)</span></h4>
                     <div class="ce-details">
                         $($Script:CyberEssentials.SecureConfiguration.Details | ForEach-Object { "<div>$_</div>" })
                     </div>
                 </div>
                 <div class="ce-item $ceUserAccessClass">
-                    <h4>ACCESS CONTROL <span class="ce-status $ceUserAccessClass">$($Script:CyberEssentials.UserAccessControl.Status)</span></h4>
+                    <h4> User Access Control <span class="ce-status $ceUserAccessClass">$($Script:CyberEssentials.UserAccessControl.Status)</span></h4>
                     <div class="ce-details">
                         $($Script:CyberEssentials.UserAccessControl.Details | ForEach-Object { "<div>$_</div>" })
                     </div>
                 </div>
                 <div class="ce-item $ceMalwareClass">
-                    <h4>MALWARE <span class="ce-status $ceMalwareClass">$($Script:CyberEssentials.MalwareProtection.Status)</span></h4>
+                    <h4> Malware Protection <span class="ce-status $ceMalwareClass">$($Script:CyberEssentials.MalwareProtection.Status)</span></h4>
                     <div class="ce-details">
                         $($Script:CyberEssentials.MalwareProtection.Details | ForEach-Object { "<div>$_</div>" })
                     </div>
                 </div>
                 <div class="ce-item $cePatchClass">
-                    <h4>PATCHING <span class="ce-status $cePatchClass">$($Script:CyberEssentials.PatchManagement.Status)</span></h4>
+                    <h4> Patch Management <span class="ce-status $cePatchClass">$($Script:CyberEssentials.PatchManagement.Status)</span></h4>
                     <div class="ce-details">
                         $($Script:CyberEssentials.PatchManagement.Details | ForEach-Object { "<div>$_</div>" })
                     </div>
@@ -4233,7 +4812,7 @@ function New-HtmlReport {
         </div>
         
         <div class="toc">
-            <h3>Table of Contents</h3>
+            <h3> Table of Contents</h3>
             <ul>
 "@
     
@@ -4249,6 +4828,16 @@ function New-HtmlReport {
         $html += "                <li><a href='#software-inventory'>Software Inventory ($($Script:SoftwareInventory.Count))</a></li>`n"
     }
     
+    # Add Browser Extensions link if extensions exist
+    if ($Script:BrowserExtensions -and $Script:BrowserExtensions.Count -gt 0) {
+        $html += "                <li><a href='#browser-extensions'>Browser Extensions ($($Script:BrowserExtensions.Count))</a></li>`n"
+    }
+    
+    # Add VS Code Extensions link if extensions exist
+    if ($Script:VSCodeExtensions -and $Script:VSCodeExtensions.Count -gt 0) {
+        $html += "                <li><a href='#vscode-extensions'>VS Code Extensions ($($Script:VSCodeExtensions.Count))</a></li>`n"
+    }
+    
     $adminStatusHtml = if ($Script:SystemInfo.IsAdmin) {
         "<span style='color: #28a745; font-weight: bold;'>[OK] Yes</span>"
     } else {
@@ -4260,7 +4849,7 @@ function New-HtmlReport {
         </div>
         
         <div class="section">
-            <div class="section-header">System Information</div>
+            <div class="section-header"> System Information</div>
             <div class="system-info-grid">
                 <div class="system-info-item"><span class="label">Hostname</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.Hostname)</span></div>
                 <div class="system-info-item"><span class="label">Domain</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.Domain)</span></div>
@@ -4282,7 +4871,7 @@ function New-HtmlReport {
         $html += @"
         
         <div class="software-inventory" id="software-inventory">
-            <h3>Software Inventory ($($Script:SoftwareInventory.Count) applications)</h3>
+            <h3> Software Inventory ($($Script:SoftwareInventory.Count) applications)</h3>
             <div class="inventory-filter">
                 <input type="text" id="softwareSearch" placeholder="Search software..." onkeyup="filterSoftware()">
                 <select id="archFilter" onchange="filterSoftware()">
@@ -4366,6 +4955,225 @@ function New-HtmlReport {
 "@
     }
     
+    # Add Browser Extensions Section
+    if ($Script:BrowserExtensions -and $Script:BrowserExtensions.Count -gt 0) {
+        $chromeExtCount = @($Script:BrowserExtensions | Where-Object { $_.Browser -eq 'Chrome' }).Count
+        $edgeExtCount = @($Script:BrowserExtensions | Where-Object { $_.Browser -eq 'Edge' }).Count
+        $firefoxExtCount = @($Script:BrowserExtensions | Where-Object { $_.Browser -eq 'Firefox' }).Count
+        
+        $html += @"
+        
+        <div class="browser-extensions" id="browser-extensions">
+            <h3>Browser Extensions ($($Script:BrowserExtensions.Count) total)
+                <span style="font-size: 13px; font-weight: normal; margin-left: 10px;">
+                    $(if ($chromeExtCount) { "<span class='ext-badge chrome'>Chrome: $chromeExtCount</span>" })
+                    $(if ($edgeExtCount) { "<span class='ext-badge edge'>Edge: $edgeExtCount</span>" })
+                    $(if ($firefoxExtCount) { "<span class='ext-badge firefox'>Firefox: $firefoxExtCount</span>" })
+                </span>
+            </h3>
+            <div class="inventory-filter">
+                <input type="text" id="extSearch" placeholder="Search extensions..." onkeyup="filterExtensions()">
+                <select id="browserFilter" onchange="filterExtensions()">
+                    <option value="">All Browsers</option>
+                    <option value="Chrome">Chrome</option>
+                    <option value="Edge">Edge</option>
+                    <option value="Firefox">Firefox</option>
+                </select>
+                <select id="extUserFilter" onchange="filterExtensions()">
+                    <option value="">All Users</option>
+"@
+        
+        # Add unique user profiles to dropdown
+        $extUsers = $Script:BrowserExtensions | Select-Object -ExpandProperty UserProfile -Unique | Sort-Object
+        foreach ($eu in $extUsers) {
+            $html += "                    <option value=`"$eu`">$eu</option>`n"
+        }
+        
+        $html += @"
+                </select>
+                <select id="extTypeFilter" onchange="filterExtensions()">
+                    <option value="">All Types</option>
+                    <option value="Policy">Policy/GPO</option>
+                    <option value="User">User Installed</option>
+                </select>
+            </div>
+            <div class="inventory-wrapper">
+                <table class="inventory-table" id="extensionsTable">
+                    <thead>
+                        <tr>
+                            <th>Browser</th>
+                            <th>User</th>
+                            <th>Profile</th>
+                            <th>Extension Name</th>
+                            <th>Version</th>
+                            <th>Install Type</th>
+                            <th>Status</th>
+                            <th>Extension ID</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+        
+        foreach ($ext in $Script:BrowserExtensions) {
+            $browserClass = $ext.Browser.ToLower()
+            $typeClass = if ($ext.InstallType -eq 'Policy') { "policy" } else { "user" }
+            $statusBadge = if ($ext.Enabled) { "Enabled" } else { "<span class='ext-badge disabled'>Disabled</span>" }
+            
+            $html += @"
+                        <tr data-browser="$($ext.Browser)" data-user="$($ext.UserProfile)" data-type="$($ext.InstallType)">
+                            <td><span class="ext-badge $browserClass">$($ext.Browser)</span></td>
+                            <td>$(ConvertTo-HtmlSafe $ext.UserProfile)</td>
+                            <td>$(ConvertTo-HtmlSafe $ext.BrowserProfile)</td>
+                            <td><strong>$(ConvertTo-HtmlSafe $ext.Name)</strong>$(if ($ext.Description) { "<br><small style='color: #6c757d;'>$(ConvertTo-HtmlSafe $ext.Description)</small>" })</td>
+                            <td>$(ConvertTo-HtmlSafe $ext.Version)</td>
+                            <td><span class="ext-badge $typeClass">$($ext.InstallType)</span></td>
+                            <td>$statusBadge</td>
+                            <td style="font-size: 10px; word-break: break-all;">$(ConvertTo-HtmlSafe $ext.ExtensionId)</td>
+                        </tr>
+"@
+        }
+        
+        $html += @"
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <script>
+        function filterExtensions() {
+            var searchText = document.getElementById('extSearch').value.toLowerCase();
+            var browserFilter = document.getElementById('browserFilter').value;
+            var userFilter = document.getElementById('extUserFilter').value;
+            var typeFilter = document.getElementById('extTypeFilter').value;
+            var rows = document.querySelectorAll('#extensionsTable tbody tr');
+            
+            rows.forEach(function(row) {
+                var text = row.textContent.toLowerCase();
+                var browser = row.getAttribute('data-browser');
+                var user = row.getAttribute('data-user');
+                var type = row.getAttribute('data-type');
+                
+                var matchesSearch = text.includes(searchText);
+                var matchesBrowser = !browserFilter || browser === browserFilter;
+                var matchesUser = !userFilter || user === userFilter;
+                var matchesType = !typeFilter || type === typeFilter;
+                
+                row.style.display = (matchesSearch && matchesBrowser && matchesUser && matchesType) ? '' : 'none';
+            });
+        }
+        </script>
+"@
+    }
+    
+    # Add VS Code Extensions Section
+    if ($Script:VSCodeExtensions -and $Script:VSCodeExtensions.Count -gt 0) {
+        $userVSExt = @($Script:VSCodeExtensions | Where-Object { $_.InstallType -eq 'User' }).Count
+        $builtInVSExt = @($Script:VSCodeExtensions | Where-Object { $_.InstallType -eq 'Built-in' }).Count
+        
+        # Get unique editors
+        $editors = $Script:VSCodeExtensions | Select-Object -ExpandProperty Editor -Unique | Sort-Object
+        
+        $html += @"
+        
+        <div class="browser-extensions" id="vscode-extensions">
+            <h3>VS Code Extensions ($($Script:VSCodeExtensions.Count) total)
+                <span style="font-size: 13px; font-weight: normal; margin-left: 10px;">
+                    User: $userVSExt | Built-in: $builtInVSExt
+                </span>
+            </h3>
+            <div class="inventory-filter">
+                <input type="text" id="vscSearch" placeholder="Search VS Code extensions..." onkeyup="filterVSCode()">
+                <select id="vscEditorFilter" onchange="filterVSCode()">
+                    <option value="">All Editors</option>
+"@
+        foreach ($ed in $editors) {
+            $html += "                    <option value=`"$ed`">$ed</option>`n"
+        }
+        
+        $html += @"
+                </select>
+                <select id="vscUserFilter" onchange="filterVSCode()">
+                    <option value="">All Users</option>
+"@
+        $vscUsers = $Script:VSCodeExtensions | Select-Object -ExpandProperty UserProfile -Unique | Sort-Object
+        foreach ($vu in $vscUsers) {
+            $html += "                    <option value=`"$vu`">$vu</option>`n"
+        }
+        
+        $html += @"
+                </select>
+                <select id="vscInstallFilter" onchange="filterVSCode()">
+                    <option value="">All Types</option>
+                    <option value="User">User Installed</option>
+                    <option value="Built-in">Built-in</option>
+                </select>
+            </div>
+            <div class="inventory-wrapper">
+                <table class="inventory-table" id="vscodeTable">
+                    <thead>
+                        <tr>
+                            <th>Editor</th>
+                            <th>User</th>
+                            <th>Extension Name</th>
+                            <th>Publisher</th>
+                            <th>Version</th>
+                            <th>Categories</th>
+                            <th>Install Type</th>
+                            <th>Extension ID</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+        
+        foreach ($ext in $Script:VSCodeExtensions) {
+            $typeClass = if ($ext.InstallType -eq 'Built-in') { "policy" } else { "user" }
+            
+            $html += @"
+                        <tr data-editor="$($ext.Editor)" data-user="$($ext.UserProfile)" data-type="$($ext.InstallType)">
+                            <td>$(ConvertTo-HtmlSafe $ext.Editor)</td>
+                            <td>$(ConvertTo-HtmlSafe $ext.UserProfile)</td>
+                            <td><strong>$(ConvertTo-HtmlSafe $ext.Name)</strong>$(if ($ext.Description) { "<br><small style='color: #6c757d;'>$(ConvertTo-HtmlSafe $ext.Description)</small>" })</td>
+                            <td>$(ConvertTo-HtmlSafe $ext.Publisher)</td>
+                            <td>$(ConvertTo-HtmlSafe $ext.Version)</td>
+                            <td style="font-size: 11px;">$(ConvertTo-HtmlSafe $ext.Categories)</td>
+                            <td><span class="ext-badge $typeClass">$($ext.InstallType)</span></td>
+                            <td style="font-size: 10px; word-break: break-all;">$(ConvertTo-HtmlSafe $ext.ExtensionId)</td>
+                        </tr>
+"@
+        }
+        
+        $html += @"
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <script>
+        function filterVSCode() {
+            var searchText = document.getElementById('vscSearch').value.toLowerCase();
+            var editorFilter = document.getElementById('vscEditorFilter').value;
+            var userFilter = document.getElementById('vscUserFilter').value;
+            var typeFilter = document.getElementById('vscInstallFilter').value;
+            var rows = document.querySelectorAll('#vscodeTable tbody tr');
+            
+            rows.forEach(function(row) {
+                var text = row.textContent.toLowerCase();
+                var editor = row.getAttribute('data-editor');
+                var user = row.getAttribute('data-user');
+                var type = row.getAttribute('data-type');
+                
+                var matchesSearch = text.includes(searchText);
+                var matchesEditor = !editorFilter || editor === editorFilter;
+                var matchesUser = !userFilter || user === userFilter;
+                var matchesType = !typeFilter || type === typeFilter;
+                
+                row.style.display = (matchesSearch && matchesEditor && matchesUser && matchesType) ? '' : 'none';
+            });
+        }
+        </script>
+"@
+    }
+    
     # Add findings by category
     foreach ($cat in $categories) {
         $catId = $cat -replace '\s+', '-' -replace '[^\w-]', ''
@@ -4390,8 +5198,8 @@ function New-HtmlReport {
         foreach ($finding in $catFindings) {
             $riskClass = "risk-$($finding.Risk.ToLower())"
             $detailsHtml = if ($finding.Details) { "<div class='finding-details'>$(ConvertTo-HtmlSafe $finding.Details)</div>" } else { "" }
-            $recHtml = if ($finding.Recommendation) { "<div class='recommendation'>Recommendation: $(ConvertTo-HtmlSafe $finding.Recommendation)</div>" } else { "" }
-            $refHtml = if ($finding.Reference) { "<div class='reference'>Reference: $(ConvertTo-HtmlSafe $finding.Reference)</div>" } else { "" }
+            $recHtml = if ($finding.Recommendation) { "<div class='recommendation'>Tip:  $(ConvertTo-HtmlSafe $finding.Recommendation)</div>" } else { "" }
+            $refHtml = if ($finding.Reference) { "<div class='reference'>Ref:  Reference: $(ConvertTo-HtmlSafe $finding.Reference)</div>" } else { "" }
             
             $html += @"
                 <div class="finding">
@@ -4475,6 +5283,7 @@ function Start-SecurityAudit {
         { Test-InstalledSoftware },
         { Test-OfficeSecurity },
         { Test-BrowserSecurity },
+        { Get-VSCodeExtensions },
         { Test-PowerShellSecurity },
         { Test-ScheduledTasks },
         { Test-UpdateStatus },
