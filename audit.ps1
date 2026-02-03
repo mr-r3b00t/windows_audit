@@ -37,7 +37,10 @@ param(
     [switch]$SkipNetworkChecks,
     
     [Parameter()]
-    [switch]$Quiet
+    [switch]$Quiet,
+    
+    [Parameter()]
+    [switch]$ExportJson
 )
 
 #Requires -Version 5.0
@@ -4699,6 +4702,10 @@ function New-HtmlReport {
                     <div><strong>Tool Version:</strong> $($Script:AuditVersion)</div>
                     <div><strong>Privileges:</strong> $headerAdminStatus</div>
                 </div>
+                <div style="margin-top: 10px;">
+                    <button onclick="exportJson()" style="background: #28a745; color: white; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600;">Export JSON</button>
+                    <button onclick="window.print()" style="background: #6c757d; color: white; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; margin-left: 6px;">Print Report</button>
+                </div>
             </div>
             <div class="score-circle">
                 <div class="score-inner">
@@ -5228,6 +5235,132 @@ function New-HtmlReport {
             <p>This report is for authorized security compliance auditing purposes only.</p>
         </footer>
     </div>
+"@
+
+    # Build embedded JSON for client-side export
+    $jsonExport = [ordered]@{
+        ReportMetadata = [ordered]@{
+            ToolVersion = $Script:AuditVersion
+            AuditDate   = $Script:AuditDate
+            Hostname    = $Script:Hostname
+            RunAsAdmin  = (Test-IsAdmin)
+        }
+        Summary = [ordered]@{
+            TotalFindings = $Script:Findings.Count
+            Critical      = @($Script:Findings | Where-Object { $_.Risk -eq 'Critical' }).Count
+            High          = @($Script:Findings | Where-Object { $_.Risk -eq 'High' }).Count
+            Medium        = @($Script:Findings | Where-Object { $_.Risk -eq 'Medium' }).Count
+            Low           = @($Script:Findings | Where-Object { $_.Risk -eq 'Low' }).Count
+            Info          = @($Script:Findings | Where-Object { $_.Risk -eq 'Info' }).Count
+        }
+        Findings = @($Script:Findings | ForEach-Object {
+            [ordered]@{
+                Category       = $_.Category
+                Name           = $_.Name
+                Risk           = $_.Risk
+                Description    = $_.Description
+                Details        = $_.Details
+                Recommendation = $_.Recommendation
+                Reference      = $_.Reference
+            }
+        })
+        SoftwareInventory = @()
+        BrowserExtensions = @()
+        VSCodeExtensions  = @()
+    }
+
+    if ($Script:CyberEssentials) {
+        $ceExport = [ordered]@{ OverallScore = $Script:CyberEssentialsScore }
+        foreach ($area in @('Firewalls', 'SecureConfiguration', 'UserAccessControl', 'MalwareProtection', 'PatchManagement')) {
+            if ($Script:CyberEssentials.ContainsKey($area)) {
+                $ceExport[$area] = [ordered]@{
+                    Status  = $Script:CyberEssentials[$area].Status
+                    Pass    = $Script:CyberEssentials[$area].Pass
+                    Details = $Script:CyberEssentials[$area].Details
+                }
+            }
+        }
+        $jsonExport['CyberEssentials'] = $ceExport
+    }
+
+    if ($Script:SoftwareInventory) {
+        $jsonExport.SoftwareInventory = @($Script:SoftwareInventory | ForEach-Object {
+            [ordered]@{
+                Name         = $_.DisplayName
+                Publisher    = $_.Publisher
+                Version      = $_.DisplayVersion
+                InstallDate  = if ($_.InstallDate) { $_.InstallDate.ToString('yyyy-MM-dd') } else { $null }
+                Architecture = $_.Architecture
+                ProductCode  = $_.ProductCode
+                IsSystemVendor = $_.IsSystemVendor
+            }
+        })
+    }
+
+    if ($Script:BrowserExtensions) {
+        $jsonExport.BrowserExtensions = @($Script:BrowserExtensions | ForEach-Object {
+            [ordered]@{
+                Browser     = $_.Browser
+                User        = $_.UserProfile
+                Name        = $_.Name
+                ExtensionId = $_.ExtensionId
+                Version     = $_.Version
+                Enabled     = $_.Enabled
+                InstallType = $_.InstallType
+            }
+        })
+    }
+
+    if ($Script:VSCodeExtensions) {
+        $jsonExport.VSCodeExtensions = @($Script:VSCodeExtensions | ForEach-Object {
+            [ordered]@{
+                Editor      = $_.Editor
+                User        = $_.UserProfile
+                Name        = $_.Name
+                Publisher   = $_.Publisher
+                Version     = $_.Version
+                ExtensionId = $_.ExtensionId
+                InstallType = $_.InstallType
+            }
+        })
+    }
+
+    # Serialize JSON and sanitize only the </script> sequence to prevent premature tag close
+    $embeddedJson = ($jsonExport | ConvertTo-Json -Depth 5) -replace '</script>', '</scr"+"ipt>'
+
+    $html += @"
+
+    <script id="auditJsonData" type="application/json">
+$embeddedJson
+    </script>
+    <script>
+    function exportJson() {
+        try {
+            var dataEl = document.getElementById('auditJsonData');
+            var _auditData = JSON.parse(dataEl.textContent);
+            var hostname = (_auditData.ReportMetadata && _auditData.ReportMetadata.Hostname) ? _auditData.ReportMetadata.Hostname : 'unknown';
+            var now = new Date();
+            var ts = now.getFullYear()
+                + ('0' + (now.getMonth()+1)).slice(-2)
+                + ('0' + now.getDate()).slice(-2)
+                + '_' + ('0' + now.getHours()).slice(-2)
+                + ('0' + now.getMinutes()).slice(-2)
+                + ('0' + now.getSeconds()).slice(-2);
+            var filename = 'SecurityAudit_' + hostname + '_' + ts + '.json';
+            _auditData.ReportMetadata.ExportDate = now.toISOString();
+            var blob = new Blob([JSON.stringify(_auditData, null, 2)], {type: 'application/json'});
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(a.href);
+        } catch(e) {
+            alert('JSON export error: ' + e.message);
+        }
+    }
+    </script>
 </body>
 </html>
 "@
@@ -5238,6 +5371,137 @@ function New-HtmlReport {
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
+
+function Export-JsonReport {
+    param(
+        [Parameter()]
+        [string]$JsonOutputPath = $OutputPath
+    )
+    
+    Write-AuditLog "Generating JSON export..." -Level "INFO"
+    
+    # Ensure output directory exists
+    if (-not (Test-Path $JsonOutputPath)) {
+        New-Item -ItemType Directory -Path $JsonOutputPath -Force | Out-Null
+    }
+    
+    $jsonFile = Join-Path $JsonOutputPath "SecurityAudit_$($Script:Hostname)_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+    
+    # Build the export object
+    $exportData = [ordered]@{
+        ReportMetadata = [ordered]@{
+            ToolVersion     = $Script:AuditVersion
+            AuditDate       = $Script:AuditDate
+            ExportDate      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            Hostname        = $Script:Hostname
+            RunAsAdmin      = (Test-IsAdmin)
+        }
+        
+        SystemInformation = $Script:SystemInfo
+        
+        Summary = [ordered]@{
+            TotalFindings = $Script:Findings.Count
+            Critical      = @($Script:Findings | Where-Object { $_.Risk -eq 'Critical' }).Count
+            High          = @($Script:Findings | Where-Object { $_.Risk -eq 'High' }).Count
+            Medium        = @($Script:Findings | Where-Object { $_.Risk -eq 'Medium' }).Count
+            Low           = @($Script:Findings | Where-Object { $_.Risk -eq 'Low' }).Count
+            Info          = @($Script:Findings | Where-Object { $_.Risk -eq 'Info' }).Count
+            Categories    = @($Script:Findings | Select-Object -ExpandProperty Category -Unique | Sort-Object)
+        }
+        
+        CyberEssentials = $null
+        
+        Findings = @($Script:Findings | ForEach-Object {
+            [ordered]@{
+                Category       = $_.Category
+                Name           = $_.Name
+                Risk           = $_.Risk
+                Description    = $_.Description
+                Details        = $_.Details
+                Recommendation = $_.Recommendation
+                Reference      = $_.Reference
+            }
+        })
+        
+        SoftwareInventory = @()
+        BrowserExtensions = @()
+        VSCodeExtensions  = @()
+    }
+    
+    # Add Cyber Essentials if available
+    if ($Script:CyberEssentials) {
+        $exportData.CyberEssentials = [ordered]@{
+            OverallScore = $Script:CyberEssentialsScore
+        }
+        foreach ($area in @('Firewalls', 'SecureConfiguration', 'UserAccessControl', 'MalwareProtection', 'PatchManagement')) {
+            if ($Script:CyberEssentials.ContainsKey($area)) {
+                $exportData.CyberEssentials[$area] = [ordered]@{
+                    Status  = $Script:CyberEssentials[$area].Status
+                    Pass    = $Script:CyberEssentials[$area].Pass
+                    Details = $Script:CyberEssentials[$area].Details
+                }
+            }
+        }
+    }
+    
+    # Add Software Inventory
+    if ($Script:SoftwareInventory) {
+        $exportData.SoftwareInventory = @($Script:SoftwareInventory | ForEach-Object {
+            [ordered]@{
+                Name           = $_.DisplayName
+                Publisher      = $_.Publisher
+                Version        = $_.DisplayVersion
+                InstallDate    = if ($_.InstallDate) { $_.InstallDate.ToString('yyyy-MM-dd') } else { $null }
+                AgeDays        = $_.AgeDays
+                Architecture   = $_.Architecture
+                ProductCode    = $_.ProductCode
+                SizeMB         = $_.EstimatedSizeMB
+                IsSystemVendor = $_.IsSystemVendor
+            }
+        })
+    }
+    
+    # Add Browser Extensions
+    if ($Script:BrowserExtensions) {
+        $exportData.BrowserExtensions = @($Script:BrowserExtensions | ForEach-Object {
+            [ordered]@{
+                Browser        = $_.Browser
+                UserProfile    = $_.UserProfile
+                BrowserProfile = $_.BrowserProfile
+                ExtensionId    = $_.ExtensionId
+                Name           = $_.Name
+                Version        = $_.Version
+                Description    = $_.Description
+                Enabled        = $_.Enabled
+                InstallType    = $_.InstallType
+            }
+        })
+    }
+    
+    # Add VS Code Extensions
+    if ($Script:VSCodeExtensions) {
+        $exportData.VSCodeExtensions = @($Script:VSCodeExtensions | ForEach-Object {
+            [ordered]@{
+                Editor      = $_.Editor
+                UserProfile = $_.UserProfile
+                Name        = $_.Name
+                Publisher   = $_.Publisher
+                Version     = $_.Version
+                Description = $_.Description
+                Categories  = $_.Categories
+                ExtensionId = $_.ExtensionId
+                InstallType = $_.InstallType
+            }
+        })
+    }
+    
+    # Export - use ConvertTo-Json with sufficient depth
+    $exportData | ConvertTo-Json -Depth 5 | Out-File -FilePath $jsonFile -Encoding UTF8
+    
+    Write-AuditLog "JSON report saved to: $jsonFile" -Level "INFO"
+    
+    return $jsonFile
+}
 
 function Start-SecurityAudit {
     $banner = @"
@@ -5321,7 +5585,7 @@ function Start-SecurityAudit {
     # Generate Cyber Essentials Summary after all modules have run
     Get-CyberEssentialsSummary
     
-    # Generate report
+    # Generate HTML report
     $html = New-HtmlReport
     
     # Ensure output directory exists
@@ -5334,6 +5598,12 @@ function Start-SecurityAudit {
     
     Write-AuditLog "Audit complete!" -Level "SUCCESS"
     Write-AuditLog "Report saved to: $reportFile" -Level "INFO"
+    
+    # Export JSON if requested via CLI parameter
+    if ($ExportJson) {
+        $jsonFile = Export-JsonReport -JsonOutputPath $OutputPath
+        Write-AuditLog "JSON exported to: $jsonFile" -Level "INFO"
+    }
     
     # Summary - use @() to ensure 0 instead of $null when no findings
     $criticalCount = @($Script:Findings | Where-Object { $_.Risk -eq 'Critical' }).Count
