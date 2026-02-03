@@ -422,16 +422,16 @@ function Get-SystemInformation {
         $vmIndicators += "BIOS version contains virtualisation indicator"
     }
     
-    # Check for hypervisor via WMI if not already detected
-    if (-not $vmDetected) {
-        if ($cs.HypervisorPresent -eq $true) {
-            $vmDetected = $true
-            $vmPlatform = "Hypervisor Detected"
-            $vmIndicators += "Win32_ComputerSystem.HypervisorPresent = True"
-        }
-    } else {
-        if ($cs.HypervisorPresent -eq $true) {
-            $vmIndicators += "HypervisorPresent: True"
+    # Check for hypervisor via WMI
+    # NOTE: HypervisorPresent alone does NOT mean VM - physical hosts running Hyper-V,
+    # VBS, or Credential Guard will also report HypervisorPresent = True.
+    # Only use as a supporting indicator, not a standalone detection.
+    if ($cs.HypervisorPresent -eq $true) {
+        if ($vmDetected) {
+            $vmIndicators += "HypervisorPresent: True (confirms VM)"
+        } else {
+            # Record it but don't flag as VM - likely a physical host with Hyper-V/VBS enabled
+            $vmIndicators += "HypervisorPresent: True (likely Hyper-V role, VBS, or Credential Guard on physical host)"
         }
     }
     
@@ -572,6 +572,133 @@ function Get-SystemInformation {
             -Description "No virtualisation indicators detected - system appears to be running on physical hardware" `
             -Details "Manufacturer: $($Script:SystemInfo.Manufacturer)`nModel: $($Script:SystemInfo.Model)"
     }
+    
+    # -- Battery / Form Factor Detection --
+    $formFactor = "Desktop"
+    $hasBattery = $false
+    $batteryDetails = @()
+    
+    # Check for battery via WMI
+    try {
+        $batteries = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue
+        if ($batteries) {
+            $hasBattery = $true
+            $batList = if ($batteries -is [array]) { $batteries } else { @($batteries) }
+            foreach ($bat in $batList) {
+                $batStatus = switch ($bat.BatteryStatus) {
+                    1 { "Discharging" } 2 { "AC Power" } 3 { "Fully Charged" }
+                    4 { "Low" } 5 { "Critical" } 6 { "Charging" }
+                    7 { "Charging/High" } 8 { "Charging/Low" } 9 { "Charging/Critical" }
+                    10 { "Undefined" } 11 { "Partially Charged" }
+                    default { "Unknown ($($bat.BatteryStatus))" }
+                }
+                $chargeStr = if ($bat.EstimatedChargeRemaining) { "$($bat.EstimatedChargeRemaining)%" } else { "N/A" }
+                $runtimeStr = ""
+                if ($bat.EstimatedRunTime -and $bat.EstimatedRunTime -ne 71582788) {
+                    $rtHrs = [math]::Floor($bat.EstimatedRunTime / 60)
+                    $rtMin = $bat.EstimatedRunTime % 60
+                    $runtimeStr = "${rtHrs}h ${rtMin}m"
+                }
+                $batName = if ($bat.Name) { $bat.Name } elseif ($bat.DeviceID) { $bat.DeviceID } else { "Battery" }
+                $batLine = "$batName | Charge: $chargeStr | Status: $batStatus"
+                if ($runtimeStr) { $batLine += " | Runtime: $runtimeStr" }
+                $batteryDetails += $batLine
+            }
+        }
+    } catch { }
+    
+    # Check chassis type for form factor
+    try {
+        $chassis = Get-CimInstance -ClassName Win32_SystemEnclosure -ErrorAction SilentlyContinue
+        if ($chassis) {
+            $chList = if ($chassis -is [array]) { $chassis[0] } else { $chassis }
+            $chassisTypes = @($chList.ChassisTypes)
+            # Map chassis type numbers to form factors
+            # Laptop/Portable: 8,9,10,11,12,14,18,21,31,32
+            # Desktop: 3,4,5,6,7,13,15,16,24,34,35,36
+            # Server: 17,23,28
+            # Tablet: 30
+            # Mini PC: 33,35
+            $chassisDesc = @()
+            foreach ($ct in $chassisTypes) {
+                $desc = switch ([int]$ct) {
+                    1  { "Other" }
+                    2  { "Unknown" }
+                    3  { "Desktop" }
+                    4  { "Low Profile Desktop" }
+                    5  { "Pizza Box" }
+                    6  { "Mini Tower" }
+                    7  { "Tower" }
+                    8  { "Portable" }
+                    9  { "Laptop" }
+                    10 { "Notebook" }
+                    11 { "Handheld" }
+                    12 { "Docking Station" }
+                    13 { "All-in-One" }
+                    14 { "Sub-Notebook" }
+                    15 { "Space Saving" }
+                    16 { "Lunch Box" }
+                    17 { "Main Server Chassis" }
+                    18 { "Expansion Chassis" }
+                    19 { "Sub-Chassis" }
+                    20 { "Bus Expansion Chassis" }
+                    21 { "Peripheral Chassis" }
+                    22 { "RAID Chassis" }
+                    23 { "Rack Mount Chassis" }
+                    24 { "Sealed-Case PC" }
+                    25 { "Multi-System Chassis" }
+                    26 { "Compact PCI" }
+                    27 { "Advanced TCA" }
+                    28 { "Blade" }
+                    29 { "Blade Enclosure" }
+                    30 { "Tablet" }
+                    31 { "Convertible" }
+                    32 { "Detachable" }
+                    33 { "IoT Gateway" }
+                    34 { "Embedded PC" }
+                    35 { "Mini PC" }
+                    36 { "Stick PC" }
+                    default { "Type $ct" }
+                }
+                $chassisDesc += $desc
+                
+                if ([int]$ct -in @(8,9,10,11,14,18,21,30,31,32)) {
+                    $formFactor = "Laptop"
+                } elseif ([int]$ct -in @(17,23,28)) {
+                    $formFactor = "Server"
+                } elseif ([int]$ct -eq 30) {
+                    $formFactor = "Tablet"
+                } elseif ([int]$ct -in @(33,35,36)) {
+                    $formFactor = "Mini PC"
+                } elseif ([int]$ct -eq 13) {
+                    $formFactor = "All-in-One"
+                }
+            }
+            
+            # Battery presence overrides chassis type for laptop detection
+            # BUT only on physical hardware - VMs on laptops pass through the host battery
+            if ($hasBattery -and $formFactor -eq "Desktop" -and -not $vmDetected) {
+                $formFactor = "Laptop"
+            }
+            
+            $Script:SystemInfo | Add-Member -NotePropertyName "ChassisType" -NotePropertyValue ($chassisDesc -join ", ") -Force
+        }
+    } catch { }
+    
+    $Script:SystemInfo | Add-Member -NotePropertyName "FormFactor" -NotePropertyValue $formFactor -Force
+    $Script:SystemInfo | Add-Member -NotePropertyName "HasBattery" -NotePropertyValue $hasBattery -Force
+    $Script:SystemInfo | Add-Member -NotePropertyName "BatteryDetails" -NotePropertyValue $batteryDetails -Force
+    
+    $formFactorDetail = "Form Factor: $formFactor"
+    if ($Script:SystemInfo.ChassisType) { $formFactorDetail += "`nChassis Type: $($Script:SystemInfo.ChassisType)" }
+    $formFactorDetail += "`nBattery: $(if ($hasBattery) { 'Detected' } else { 'Not detected' })"
+    if ($batteryDetails.Count -gt 0) {
+        $formFactorDetail += "`n$($batteryDetails -join "`n")"
+    }
+    
+    Add-Finding -Category "System Info" -Name "Device Form Factor" -Risk "Info" `
+        -Description "Device identified as: $formFactor$(if ($hasBattery -and -not $vmDetected) { ' (battery present)' } elseif ($hasBattery -and $vmDetected) { ' (battery passed through from host)' })" `
+        -Details $formFactorDetail
     
     # -- Disk and Volume Enumeration --
     Write-AuditLog "Enumerating Disks and Storage Volumes..." -Level "INFO"
@@ -6162,6 +6289,28 @@ function New-HtmlReport {
                         "<span style='background: #28a745; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px;'>Physical</span>"
                     }
                 )</span></div>
+                <div class="system-info-item"><span class="label">Form Factor</span><span class="value">$(
+                    $ffIcon = switch ($Script:SystemInfo.FormFactor) {
+                        'Laptop'    { "&#x1F4BB;" }
+                        'Tablet'    { "&#x1F4F1;" }
+                        'Server'    { "&#x1F5A5;" }
+                        'Mini PC'   { "&#x1F5B3;" }
+                        'All-in-One' { "&#x1F5B5;" }
+                        default     { "&#x1F5A5;" }
+                    }
+                    "$ffIcon &nbsp;$($Script:SystemInfo.FormFactor)$(if ($Script:SystemInfo.ChassisType) { " &nbsp;<span style='color: #666; font-size: 12px;'>(Chassis: $($Script:SystemInfo.ChassisType))</span>" })"
+                )</span></div>
+                <div class="system-info-item"><span class="label">Battery</span><span class="value">$(
+                    if ($Script:SystemInfo.HasBattery) {
+                        $batHtml = "<span style='background: #28a745; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px;'>Detected</span>"
+                        if ($Script:SystemInfo.BatteryDetails.Count -gt 0) {
+                            $batHtml += " &nbsp;<span style='font-size: 12px;'>$(ConvertTo-HtmlSafe ($Script:SystemInfo.BatteryDetails[0]))</span>"
+                        }
+                        $batHtml
+                    } else {
+                        "<span style='background: #6c757d; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px;'>Not detected</span>"
+                    }
+                )</span></div>
                 <div class="system-info-item"><span class="label">Make / Model</span><span class="value">$(ConvertTo-HtmlSafe "$($Script:SystemInfo.Manufacturer) $($Script:SystemInfo.Model)")</span></div>
                 <div class="system-info-item"><span class="label">Serial Number</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.SerialNumber)</span></div>
                 <div class="system-info-item"><span class="label">Baseboard</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.Baseboard)</span></div>
@@ -7007,6 +7156,10 @@ function New-HtmlReport {
             IsVirtualMachine = $Script:SystemInfo.IsVirtualMachine
             VMPlatform   = $Script:SystemInfo.VMPlatform
             VMIndicators = @($Script:SystemInfo.VMIndicators)
+            FormFactor   = $Script:SystemInfo.FormFactor
+            ChassisType  = $Script:SystemInfo.ChassisType
+            HasBattery   = $Script:SystemInfo.HasBattery
+            BatteryDetails = @($Script:SystemInfo.BatteryDetails)
         }
         TPM = if ($Script:TPMInfo) {
             [ordered]@{
