@@ -573,6 +573,220 @@ function Get-SystemInformation {
             -Details "Manufacturer: $($Script:SystemInfo.Manufacturer)`nModel: $($Script:SystemInfo.Model)"
     }
     
+    # -- Disk and Volume Enumeration --
+    Write-AuditLog "Enumerating Disks and Storage Volumes..." -Level "INFO"
+    
+    $Script:DiskInventory = @()
+    $Script:VolumeInventory = @()
+    
+    # Physical / Virtual Disks
+    try {
+        $diskDrives = Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop
+        if ($diskDrives) {
+            $ddList = if ($diskDrives -is [array]) { $diskDrives } else { @($diskDrives) }
+            foreach ($dd in $ddList) {
+                $sizeGB = if ($dd.Size) { [math]::Round($dd.Size / 1GB, 2) } else { 0 }
+                $mediaType = if ($dd.MediaType) { $dd.MediaType } else { "Unknown" }
+                $busType = if ($dd.InterfaceType) { $dd.InterfaceType } else { "Unknown" }
+                
+                # Try to get more detail from MSFT_PhysicalDisk (Storage Spaces / NVMe aware)
+                $healthStatus = "N/A"
+                $msftMediaType = ""
+                $serialNum = if ($dd.SerialNumber) { $dd.SerialNumber.Trim() } else { "" }
+                $fwRev = if ($dd.FirmwareRevision) { $dd.FirmwareRevision.Trim() } else { "" }
+                
+                try {
+                    $pDisks = Get-CimInstance -Namespace "root\Microsoft\Windows\Storage" -ClassName MSFT_PhysicalDisk -ErrorAction SilentlyContinue
+                    if ($pDisks) {
+                        $pdList = if ($pDisks -is [array]) { $pDisks } else { @($pDisks) }
+                        # Match by disk number from DeviceID
+                        $diskNum = $null
+                        if ($dd.DeviceID -match '(\d+)$') { $diskNum = $Matches[1] }
+                        foreach ($pd in $pdList) {
+                            if ($pd.DeviceId -eq $diskNum) {
+                                $healthStatus = switch ($pd.HealthStatus) {
+                                    0 { "Healthy" } 1 { "Warning" } 2 { "Unhealthy" } 5 { "Unknown" } default { "Status $($pd.HealthStatus)" }
+                                }
+                                $msftMediaType = switch ($pd.MediaType) {
+                                    0 { "Unspecified" } 3 { "HDD" } 4 { "SSD" } 5 { "SCM" } default { "" }
+                                }
+                                if (-not $serialNum -and $pd.SerialNumber) { $serialNum = $pd.SerialNumber.Trim() }
+                                if (-not $fwRev -and $pd.FirmwareVersion) { $fwRev = $pd.FirmwareVersion.Trim() }
+                                break
+                            }
+                        }
+                    }
+                } catch { }
+                
+                $diskType = if ($msftMediaType -and $msftMediaType -ne "Unspecified") { $msftMediaType } else {
+                    # Heuristic: if no rotational media string and model suggests SSD/NVMe
+                    $modelLower = ($dd.Model).ToLower()
+                    if ($modelLower -match 'ssd|nvme|solid state|flash') { "SSD" }
+                    elseif ($modelLower -match 'hdd|hard disk|barracuda|ironwolf|caviar') { "HDD" }
+                    else { "Unknown" }
+                }
+                
+                $Script:DiskInventory += [PSCustomObject]@{
+                    DiskNumber    = if ($dd.DeviceID -match '(\d+)$') { [int]$Matches[1] } else { -1 }
+                    Model         = if ($dd.Model) { $dd.Model.Trim() } else { "Unknown" }
+                    SerialNumber  = $serialNum
+                    FirmwareRev   = $fwRev
+                    MediaType     = $diskType
+                    BusType       = $busType
+                    SizeGB        = $sizeGB
+                    Partitions    = $dd.Partitions
+                    Health        = $healthStatus
+                    Status        = if ($dd.Status) { $dd.Status } else { "Unknown" }
+                }
+            }
+        }
+    } catch {
+        Write-AuditLog "Failed to enumerate disk drives: $_" -Level "WARN"
+    }
+    
+    # Volumes / Logical Disks
+    try {
+        $volumes = Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction Stop
+        if ($volumes) {
+            $volList = if ($volumes -is [array]) { $volumes } else { @($volumes) }
+            foreach ($vol in $volList) {
+                $driveType = switch ($vol.DriveType) {
+                    0 { "Unknown" } 1 { "No Root" } 2 { "Removable" } 3 { "Fixed" }
+                    4 { "Network" } 5 { "Optical" } 6 { "RAM Disk" } default { "Type $($vol.DriveType)" }
+                }
+                
+                $totalGB = if ($vol.Size) { [math]::Round($vol.Size / 1GB, 2) } else { 0 }
+                $freeGB = if ($vol.FreeSpace) { [math]::Round($vol.FreeSpace / 1GB, 2) } else { 0 }
+                $usedGB = [math]::Round($totalGB - $freeGB, 2)
+                $pctFree = if ($totalGB -gt 0) { [math]::Round(($freeGB / $totalGB) * 100, 1) } else { 0 }
+                $pctUsed = if ($totalGB -gt 0) { [math]::Round(100 - $pctFree, 1) } else { 0 }
+                
+                $Script:VolumeInventory += [PSCustomObject]@{
+                    DriveLetter   = $vol.DeviceID
+                    VolumeName    = if ($vol.VolumeName) { $vol.VolumeName } else { "(No Label)" }
+                    DriveType     = $driveType
+                    FileSystem    = if ($vol.FileSystem) { $vol.FileSystem } else { "N/A" }
+                    TotalGB       = $totalGB
+                    UsedGB        = $usedGB
+                    FreeGB        = $freeGB
+                    PercentFree   = $pctFree
+                    PercentUsed   = $pctUsed
+                    Compressed    = [bool]$vol.Compressed
+                }
+            }
+        }
+    } catch {
+        Write-AuditLog "Failed to enumerate volumes: $_" -Level "WARN"
+    }
+    
+    # Also grab BitLocker volume encryption status if available
+    $Script:VolumeEncryption = @{}
+    try {
+        $blVolumes = Get-CimInstance -Namespace "root\cimv2\Security\MicrosoftVolumeEncryption" -ClassName Win32_EncryptableVolume -ErrorAction SilentlyContinue
+        if ($blVolumes) {
+            $blList = if ($blVolumes -is [array]) { $blVolumes } else { @($blVolumes) }
+            foreach ($blv in $blList) {
+                $protStatus = switch ($blv.ProtectionStatus) {
+                    0 { "Unprotected" } 1 { "Protected" } 2 { "Unknown" } default { "Status $($blv.ProtectionStatus)" }
+                }
+                $convStatus = switch ($blv.ConversionStatus) {
+                    0 { "Fully Decrypted" } 1 { "Fully Encrypted" } 2 { "Encrypting" }
+                    3 { "Decrypting" } 4 { "Encryption Paused" } 5 { "Decryption Paused" }
+                    default { "Status $($blv.ConversionStatus)" }
+                }
+                $encMethod = switch ($blv.EncryptionMethod) {
+                    0 { "None" } 1 { "AES-128 Diffuser" } 2 { "AES-256 Diffuser" }
+                    3 { "AES-128" } 4 { "AES-256" } 6 { "XTS-AES-128" } 7 { "XTS-AES-256" }
+                    default { "Method $($blv.EncryptionMethod)" }
+                }
+                $letter = $blv.DriveLetter
+                if ($letter) {
+                    $Script:VolumeEncryption[$letter] = [PSCustomObject]@{
+                        Protection = $protStatus
+                        Conversion = $convStatus
+                        Method     = $encMethod
+                    }
+                }
+            }
+        }
+    } catch { }
+    
+    # Store in SystemInfo
+    $Script:SystemInfo | Add-Member -NotePropertyName "Disks" -NotePropertyValue $Script:DiskInventory -Force
+    $Script:SystemInfo | Add-Member -NotePropertyName "Volumes" -NotePropertyValue $Script:VolumeInventory -Force
+    
+    # Generate findings
+    $diskSummaryLines = @()
+    foreach ($d in $Script:DiskInventory) {
+        $diskSummaryLines += "Disk $($d.DiskNumber): $($d.Model) | $($d.MediaType) | $($d.SizeGB) GB | $($d.BusType) | Health: $($d.Health)"
+    }
+    
+    $volSummaryLines = @()
+    foreach ($v in $Script:VolumeInventory) {
+        if ($v.DriveType -eq "Fixed" -or $v.DriveType -eq "Removable") {
+            $encStr = ""
+            if ($Script:VolumeEncryption.ContainsKey($v.DriveLetter)) {
+                $enc = $Script:VolumeEncryption[$v.DriveLetter]
+                $encStr = " | BitLocker: $($enc.Protection) ($($enc.Method))"
+            }
+            $volSummaryLines += "$($v.DriveLetter) $($v.VolumeName) | $($v.FileSystem) | $($v.TotalGB) GB total, $($v.FreeGB) GB free ($($v.PercentFree)%)$encStr"
+        }
+    }
+    
+    if ($diskSummaryLines.Count -gt 0) {
+        Add-Finding -Category "System Info" -Name "Storage Disks" -Risk "Info" `
+            -Description "$($Script:DiskInventory.Count) disk(s) detected" `
+            -Details ($diskSummaryLines -join "`n")
+    }
+    
+    if ($volSummaryLines.Count -gt 0) {
+        Add-Finding -Category "System Info" -Name "Storage Volumes" -Risk "Info" `
+            -Description "$($Script:VolumeInventory.Count) volume(s) detected" `
+            -Details ($volSummaryLines -join "`n")
+    }
+    
+    # Flag volumes with low free space
+    foreach ($v in $Script:VolumeInventory) {
+        if ($v.DriveType -eq "Fixed" -and $v.TotalGB -gt 0) {
+            if ($v.PercentFree -lt 5) {
+                Add-Finding -Category "System Info" -Name "Critical Low Disk Space: $($v.DriveLetter)" -Risk "High" `
+                    -Description "Volume $($v.DriveLetter) ($($v.VolumeName)) has only $($v.FreeGB) GB free ($($v.PercentFree)%)" `
+                    -Details "Total: $($v.TotalGB) GB | Used: $($v.UsedGB) GB | Free: $($v.FreeGB) GB`nLow disk space can prevent Windows Update, crash applications, and impact security logging." `
+                    -Recommendation "Free up disk space or expand the volume immediately"
+            } elseif ($v.PercentFree -lt 10) {
+                Add-Finding -Category "System Info" -Name "Low Disk Space: $($v.DriveLetter)" -Risk "Medium" `
+                    -Description "Volume $($v.DriveLetter) ($($v.VolumeName)) has $($v.FreeGB) GB free ($($v.PercentFree)%)" `
+                    -Details "Total: $($v.TotalGB) GB | Used: $($v.UsedGB) GB | Free: $($v.FreeGB) GB" `
+                    -Recommendation "Consider freeing disk space to ensure Windows Update and security tools can function"
+            }
+        }
+    }
+    
+    # Flag unhealthy disks
+    foreach ($d in $Script:DiskInventory) {
+        if ($d.Health -eq "Warning") {
+            Add-Finding -Category "System Info" -Name "Disk Health Warning: Disk $($d.DiskNumber)" -Risk "High" `
+                -Description "Disk $($d.DiskNumber) ($($d.Model)) is reporting a health warning" `
+                -Details "Health: $($d.Health) | Status: $($d.Status) | Size: $($d.SizeGB) GB" `
+                -Recommendation "Back up data immediately and consider replacing this disk"
+        } elseif ($d.Health -eq "Unhealthy") {
+            Add-Finding -Category "System Info" -Name "Disk Unhealthy: Disk $($d.DiskNumber)" -Risk "Critical" `
+                -Description "Disk $($d.DiskNumber) ($($d.Model)) is reporting as unhealthy - imminent failure risk" `
+                -Details "Health: $($d.Health) | Status: $($d.Status) | Size: $($d.SizeGB) GB" `
+                -Recommendation "Back up all data IMMEDIATELY and replace this disk"
+        }
+    }
+    
+    # Flag non-NTFS system volumes
+    foreach ($v in $Script:VolumeInventory) {
+        if ($v.DriveLetter -eq "C:" -and $v.FileSystem -and $v.FileSystem -ne "NTFS" -and $v.FileSystem -ne "ReFS") {
+            Add-Finding -Category "System Info" -Name "System Drive Non-NTFS" -Risk "Medium" `
+                -Description "System drive C: is using $($v.FileSystem) instead of NTFS" `
+                -Details "File system: $($v.FileSystem). NTFS is required for proper Windows security features including file permissions, EFS, and audit logging." `
+                -Recommendation "The system drive should use NTFS for proper security controls"
+        }
+    }
+    
     # CRITICAL: Warn if not running as admin
     if (-not $Script:SystemInfo.IsAdmin) {
         Add-Finding -Category "System Info" -Name "[!!] SCAN RUN WITHOUT ADMIN RIGHTS" -Risk "Critical" `
@@ -5776,6 +5990,14 @@ function New-HtmlReport {
         $html += "                <li><a href='#$catId'>$cat</a></li>`n"
     }
     
+    # Add Storage links
+    if ($Script:DiskInventory -and $Script:DiskInventory.Count -gt 0) {
+        $html += "                <li><a href='#storage-disks'>Physical Disks ($($Script:DiskInventory.Count))</a></li>`n"
+    }
+    if ($Script:VolumeInventory -and $Script:VolumeInventory.Count -gt 0) {
+        $html += "                <li><a href='#storage-volumes'>Storage Volumes ($($Script:VolumeInventory.Count))</a></li>`n"
+    }
+    
     # Add Software Inventory link if inventory exists
     if ($Script:SoftwareInventory -and $Script:SoftwareInventory.Count -gt 0) {
         $html += "                <li><a href='#software-inventory'>Software Inventory ($($Script:SoftwareInventory.Count))</a></li>`n"
@@ -5903,6 +6125,128 @@ function New-HtmlReport {
                 <div class="system-info-item"><span class="label">PPI Version</span><span class="value">$(ConvertTo-HtmlSafe $Script:TPMInfo.PPIVersion)</span></div>
                 <div class="system-info-item"><span class="label">Owner Authorization</span><span class="value">$(ConvertTo-HtmlSafe $Script:TPMInfo.OwnerAuth)</span></div>
                 <div class="system-info-item"><span class="label">Block TPM Clear</span><span class="value">$(if ($null -ne $Script:TPMInfo.BlockClear) { if ($Script:TPMInfo.BlockClear -eq 1) { 'Yes (Policy)' } else { 'No' } } else { 'Not configured' })</span></div>
+            </div>
+        </div>
+"@
+    }
+
+    # Add Storage Disks Section
+    if ($Script:DiskInventory -and $Script:DiskInventory.Count -gt 0) {
+        $html += @"
+        
+        <div class="section" id="storage-disks">
+            <div class="section-header"> Physical Disks ($($Script:DiskInventory.Count))</div>
+            <div class="inventory-wrapper">
+                <table class="inventory-table">
+                    <thead>
+                        <tr>
+                            <th>Disk #</th>
+                            <th>Model</th>
+                            <th>Serial Number</th>
+                            <th>Type</th>
+                            <th>Bus</th>
+                            <th>Size (GB)</th>
+                            <th>Partitions</th>
+                            <th>Firmware</th>
+                            <th>Health</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+        foreach ($d in ($Script:DiskInventory | Sort-Object DiskNumber)) {
+            $healthClass = switch ($d.Health) {
+                "Healthy"   { "background: #d4edda; color: #155724;" }
+                "Warning"   { "background: #fff3cd; color: #856404;" }
+                "Unhealthy" { "background: #f8d7da; color: #721c24;" }
+                default     { "" }
+            }
+            $typeIcon = switch ($d.MediaType) {
+                "SSD" { "SSD" }
+                "HDD" { "HDD" }
+                default { $d.MediaType }
+            }
+            $html += "                        <tr>`n"
+            $html += "                            <td>$($d.DiskNumber)</td>`n"
+            $html += "                            <td>$(ConvertTo-HtmlSafe $d.Model)</td>`n"
+            $html += "                            <td style='font-size: 11px;'>$(ConvertTo-HtmlSafe $d.SerialNumber)</td>`n"
+            $html += "                            <td>$typeIcon</td>`n"
+            $html += "                            <td>$($d.BusType)</td>`n"
+            $html += "                            <td>$($d.SizeGB)</td>`n"
+            $html += "                            <td>$($d.Partitions)</td>`n"
+            $html += "                            <td style='font-size: 11px;'>$(ConvertTo-HtmlSafe $d.FirmwareRev)</td>`n"
+            $html += "                            <td><span style='padding: 2px 8px; border-radius: 4px; font-size: 12px; $healthClass'>$($d.Health)</span></td>`n"
+            $html += "                        </tr>`n"
+        }
+        $html += @"
+                    </tbody>
+                </table>
+            </div>
+        </div>
+"@
+    }
+
+    # Add Storage Volumes Section
+    if ($Script:VolumeInventory -and $Script:VolumeInventory.Count -gt 0) {
+        $html += @"
+        
+        <div class="section" id="storage-volumes">
+            <div class="section-header"> Storage Volumes ($($Script:VolumeInventory.Count))</div>
+            <div class="inventory-wrapper">
+                <table class="inventory-table">
+                    <thead>
+                        <tr>
+                            <th>Drive</th>
+                            <th>Label</th>
+                            <th>Type</th>
+                            <th>File System</th>
+                            <th>Total (GB)</th>
+                            <th>Used (GB)</th>
+                            <th>Free (GB)</th>
+                            <th>Usage</th>
+                            <th>BitLocker</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+        foreach ($v in ($Script:VolumeInventory | Sort-Object DriveLetter)) {
+            # Usage bar
+            $barColor = if ($v.PercentUsed -gt 95) { "#dc3545" } elseif ($v.PercentUsed -gt 85) { "#ffc107" } else { "#28a745" }
+            $usageBar = ""
+            if ($v.TotalGB -gt 0) {
+                $usageBar = "<div style='width: 100px; background: #e9ecef; border-radius: 4px; overflow: hidden; display: inline-block; vertical-align: middle; height: 16px;'><div style='width: $($v.PercentUsed)%; background: $barColor; height: 100%;'></div></div> <span style='font-size: 11px;'>$($v.PercentUsed)%</span>"
+            } else {
+                $usageBar = "N/A"
+            }
+            
+            # BitLocker status
+            $blStatus = ""
+            if ($Script:VolumeEncryption.ContainsKey($v.DriveLetter)) {
+                $enc = $Script:VolumeEncryption[$v.DriveLetter]
+                $blColor = switch ($enc.Protection) {
+                    "Protected"   { "background: #28a745; color: white;" }
+                    "Unprotected" { "background: #dc3545; color: white;" }
+                    default       { "background: #6c757d; color: white;" }
+                }
+                $blStatus = "<span style='padding: 2px 8px; border-radius: 4px; font-size: 11px; $blColor'>$($enc.Protection)</span><br><span style='font-size: 10px; color: #666;'>$($enc.Method)</span>"
+            } else {
+                $blStatus = "<span style='font-size: 11px; color: #999;'>N/A</span>"
+            }
+            
+            $html += "                        <tr>`n"
+            $html += "                            <td><strong>$($v.DriveLetter)</strong></td>`n"
+            $html += "                            <td>$(ConvertTo-HtmlSafe $v.VolumeName)</td>`n"
+            $html += "                            <td>$($v.DriveType)</td>`n"
+            $html += "                            <td>$($v.FileSystem)</td>`n"
+            $html += "                            <td>$($v.TotalGB)</td>`n"
+            $html += "                            <td>$($v.UsedGB)</td>`n"
+            $html += "                            <td>$($v.FreeGB)</td>`n"
+            $html += "                            <td>$usageBar</td>`n"
+            $html += "                            <td>$blStatus</td>`n"
+            $html += "                        </tr>`n"
+        }
+        $html += @"
+                    </tbody>
+                </table>
             </div>
         </div>
 "@
@@ -6561,6 +6905,46 @@ function New-HtmlReport {
         })
     }
 
+    if ($Script:DiskInventory -and $Script:DiskInventory.Count -gt 0) {
+        $jsonExport['Disks'] = @($Script:DiskInventory | ForEach-Object {
+            [ordered]@{
+                DiskNumber   = $_.DiskNumber
+                Model        = $_.Model
+                SerialNumber = $_.SerialNumber
+                FirmwareRev  = $_.FirmwareRev
+                MediaType    = $_.MediaType
+                BusType      = $_.BusType
+                SizeGB       = $_.SizeGB
+                Partitions   = $_.Partitions
+                Health       = $_.Health
+                Status       = $_.Status
+            }
+        })
+    }
+
+    if ($Script:VolumeInventory -and $Script:VolumeInventory.Count -gt 0) {
+        $jsonExport['Volumes'] = @($Script:VolumeInventory | ForEach-Object {
+            $volEnc = $null
+            if ($Script:VolumeEncryption.ContainsKey($_.DriveLetter)) {
+                $e = $Script:VolumeEncryption[$_.DriveLetter]
+                $volEnc = [ordered]@{ Protection = $e.Protection; Conversion = $e.Conversion; Method = $e.Method }
+            }
+            [ordered]@{
+                DriveLetter  = $_.DriveLetter
+                VolumeName   = $_.VolumeName
+                DriveType    = $_.DriveType
+                FileSystem   = $_.FileSystem
+                TotalGB      = $_.TotalGB
+                UsedGB       = $_.UsedGB
+                FreeGB       = $_.FreeGB
+                PercentFree  = $_.PercentFree
+                PercentUsed  = $_.PercentUsed
+                Compressed   = $_.Compressed
+                BitLocker    = $volEnc
+            }
+        })
+    }
+
     # Serialize JSON and sanitize only the </script> sequence to prevent premature tag close
     $embeddedJson = ($jsonExport | ConvertTo-Json -Depth 5) -replace '</script>', '</scr"+"ipt>'
 
@@ -6745,6 +7129,32 @@ function Export-JsonReport {
                 Result      = $_.Result
                 Source      = $_.Source
                 InstalledBy = $_.InstalledBy
+            }
+        })
+    }
+    
+    if ($Script:DiskInventory -and $Script:DiskInventory.Count -gt 0) {
+        $exportData['Disks'] = @($Script:DiskInventory | ForEach-Object {
+            [ordered]@{
+                DiskNumber = $_.DiskNumber; Model = $_.Model; SerialNumber = $_.SerialNumber
+                FirmwareRev = $_.FirmwareRev; MediaType = $_.MediaType; BusType = $_.BusType
+                SizeGB = $_.SizeGB; Partitions = $_.Partitions; Health = $_.Health; Status = $_.Status
+            }
+        })
+    }
+    
+    if ($Script:VolumeInventory -and $Script:VolumeInventory.Count -gt 0) {
+        $exportData['Volumes'] = @($Script:VolumeInventory | ForEach-Object {
+            $volEnc = $null
+            if ($Script:VolumeEncryption.ContainsKey($_.DriveLetter)) {
+                $e = $Script:VolumeEncryption[$_.DriveLetter]
+                $volEnc = [ordered]@{ Protection = $e.Protection; Conversion = $e.Conversion; Method = $e.Method }
+            }
+            [ordered]@{
+                DriveLetter = $_.DriveLetter; VolumeName = $_.VolumeName; DriveType = $_.DriveType
+                FileSystem = $_.FileSystem; TotalGB = $_.TotalGB; UsedGB = $_.UsedGB; FreeGB = $_.FreeGB
+                PercentFree = $_.PercentFree; PercentUsed = $_.PercentUsed; Compressed = $_.Compressed
+                BitLocker = $volEnc
             }
         })
     }
