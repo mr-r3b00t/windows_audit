@@ -1791,6 +1791,111 @@ function Test-WindowsFeatures {
             -Description "Could not determine Windows Defender status" `
             -Details "May be using third-party antivirus or running on Windows Server without Defender"
     }
+    
+    # -- Full Windows Optional Features Inventory --
+    Write-AuditLog "Enumerating Windows Optional Features..." -Level "INFO"
+    $Script:WindowsFeatures = @()
+    
+    try {
+        $allFeatures = Get-WindowsOptionalFeature -Online -ErrorAction Stop
+        if ($allFeatures) {
+            $fList = if ($allFeatures -is [array]) { $allFeatures } else { @($allFeatures) }
+            
+            # Security-relevant features to flag
+            $securityRelevant = @{
+                'SMB1Protocol'                   = @{ Risk = "High";   Note = "Legacy SMB - EternalBlue/WannaCry attack vector" }
+                'SMB1Protocol-Server'             = @{ Risk = "High";   Note = "SMBv1 server component" }
+                'SMB1Protocol-Client'             = @{ Risk = "High";   Note = "SMBv1 client component" }
+                'MicrosoftWindowsPowerShellV2'    = @{ Risk = "High";   Note = "PowerShell v2 bypasses script logging and AMSI" }
+                'MicrosoftWindowsPowerShellV2Root'= @{ Risk = "High";   Note = "PowerShell v2 engine root feature" }
+                'TelnetClient'                    = @{ Risk = "Medium"; Note = "Unencrypted remote access protocol" }
+                'TelnetServer'                    = @{ Risk = "High";   Note = "Unencrypted remote access server" }
+                'TFTP'                            = @{ Risk = "Medium"; Note = "Unauthenticated file transfer protocol" }
+                'TIFFIFilter'                     = @{ Risk = "Low";    Note = "TIFF image filter - rarely needed" }
+                'Internet-Explorer-Optional-amd64'= @{ Risk = "Medium"; Note = "Legacy browser with known vulnerabilities" }
+                'IIS-WebServer'                   = @{ Risk = "Medium"; Note = "Web server - increases attack surface" }
+                'IIS-WebServerRole'               = @{ Risk = "Medium"; Note = "IIS web server role" }
+                'IIS-FTPServer'                   = @{ Risk = "High";   Note = "FTP server - credentials sent in cleartext" }
+                'Microsoft-Windows-Subsystem-Linux' = @{ Risk = "Low"; Note = "WSL - can bypass Windows security controls" }
+                'VirtualMachinePlatform'          = @{ Risk = "Low";    Note = "Hypervisor platform for WSL2/Hyper-V" }
+                'Microsoft-Hyper-V-All'           = @{ Risk = "Low";    Note = "Hyper-V virtualisation" }
+                'Microsoft-Hyper-V'               = @{ Risk = "Low";    Note = "Hyper-V hypervisor" }
+                'Containers'                      = @{ Risk = "Low";    Note = "Windows Containers support" }
+                'Windows-Defender-ApplicationGuard' = @{ Risk = "Info"; Note = "Application Guard browser isolation" }
+                'Windows-Sandbox'                 = @{ Risk = "Info";   Note = "Disposable sandbox environment" }
+                'WorkFolders-Client'              = @{ Risk = "Low";    Note = "Work Folders sync client" }
+                'NetFx3'                          = @{ Risk = "Low";    Note = ".NET Framework 3.5 - may be needed for legacy apps" }
+                'WCF-Services45'                  = @{ Risk = "Low";    Note = "WCF services - may expand attack surface" }
+                'SimpleTCP'                       = @{ Risk = "Medium"; Note = "Simple TCP/IP services (echo, daytime, etc.)" }
+                'SmbDirect'                       = @{ Risk = "Low";    Note = "SMB Direct (RDMA) support" }
+                'MSRDC-Infrastructure'            = @{ Risk = "Low";    Note = "Remote Desktop client infrastructure" }
+                'DirectPlay'                      = @{ Risk = "Low";    Note = "Legacy DirectPlay networking" }
+                'LegacyComponents'                = @{ Risk = "Low";    Note = "Legacy Windows components" }
+                'Printing-Foundation-Features'     = @{ Risk = "Low";    Note = "Print foundation" }
+                'Printing-Foundation-LPDPrintService' = @{ Risk = "Medium"; Note = "LPD print service - legacy, rarely needed" }
+                'Printing-Foundation-LPRPortMonitor'  = @{ Risk = "Low";    Note = "LPR port monitor" }
+                'SearchEngine-Client-Package'     = @{ Risk = "Low";    Note = "Windows Search" }
+                'SNMP'                            = @{ Risk = "Medium"; Note = "SNMP - community strings often weak" }
+                'WMISnmpProvider'                 = @{ Risk = "Medium"; Note = "WMI SNMP provider" }
+                'RasRip'                          = @{ Risk = "Medium"; Note = "RIP listener - routing protocol" }
+                'MediaPlayback'                   = @{ Risk = "Low";    Note = "Media playback features" }
+                'WindowsMediaPlayer'              = @{ Risk = "Low";    Note = "Windows Media Player" }
+            }
+            
+            foreach ($f in $fList) {
+                $state = $f.State.ToString()
+                $secInfo = $null
+                $secRisk = "None"
+                $secNote = ""
+                
+                if ($securityRelevant.ContainsKey($f.FeatureName)) {
+                    $secInfo = $securityRelevant[$f.FeatureName]
+                    $secRisk = $secInfo.Risk
+                    $secNote = $secInfo.Note
+                }
+                
+                $Script:WindowsFeatures += [PSCustomObject]@{
+                    FeatureName  = $f.FeatureName
+                    State        = $state
+                    SecurityRisk = $secRisk
+                    SecurityNote = $secNote
+                    RestartNeeded = if ($f.RestartNeeded) { $f.RestartNeeded.ToString() } else { "No" }
+                }
+            }
+            
+            # Count enabled features
+            $enabledFeatures = @($Script:WindowsFeatures | Where-Object { $_.State -eq 'Enabled' })
+            $disabledFeatures = @($Script:WindowsFeatures | Where-Object { $_.State -eq 'Disabled' })
+            $enabledSecRisk = @($enabledFeatures | Where-Object { $_.SecurityRisk -ne 'None' -and $_.SecurityRisk -ne 'Info' })
+            
+            Add-Finding -Category "Windows Features" -Name "Windows Features Inventory" -Risk "Info" `
+                -Description "$($enabledFeatures.Count) features enabled, $($disabledFeatures.Count) disabled out of $($Script:WindowsFeatures.Count) total" `
+                -Details "Enabled: $($enabledFeatures.Count)`nDisabled: $($disabledFeatures.Count)`nSecurity-relevant enabled: $($enabledSecRisk.Count)"
+            
+            # Flag enabled security-relevant features
+            $highRiskEnabled = @($enabledFeatures | Where-Object { $_.SecurityRisk -eq 'High' })
+            $medRiskEnabled = @($enabledFeatures | Where-Object { $_.SecurityRisk -eq 'Medium' })
+            
+            if ($highRiskEnabled.Count -gt 0) {
+                $flaggedList = ($highRiskEnabled | ForEach-Object { "  $($_.FeatureName) - $($_.SecurityNote)" }) -join "`n"
+                Add-Finding -Category "Windows Features" -Name "High-Risk Features Enabled" -Risk "High" `
+                    -Description "$($highRiskEnabled.Count) high-risk Windows optional feature(s) are enabled" `
+                    -Details "Enabled high-risk features:`n$flaggedList" `
+                    -Recommendation "Disable unnecessary high-risk features using: Disable-WindowsOptionalFeature -Online -FeatureName <name>" `
+                    -Reference "CIS Benchmark - Windows Features"
+            }
+            
+            if ($medRiskEnabled.Count -gt 0) {
+                $flaggedList = ($medRiskEnabled | ForEach-Object { "  $($_.FeatureName) - $($_.SecurityNote)" }) -join "`n"
+                Add-Finding -Category "Windows Features" -Name "Medium-Risk Features Enabled" -Risk "Medium" `
+                    -Description "$($medRiskEnabled.Count) medium-risk Windows optional feature(s) are enabled" `
+                    -Details "Enabled medium-risk features:`n$flaggedList" `
+                    -Recommendation "Review whether these features are required and disable if not needed"
+            }
+        }
+    } catch {
+        Write-AuditLog "Failed to enumerate Windows Optional Features: $_" -Level "WARN"
+    }
 }
 
 function Test-Services {
@@ -5998,6 +6103,12 @@ function New-HtmlReport {
         $html += "                <li><a href='#storage-volumes'>Storage Volumes ($($Script:VolumeInventory.Count))</a></li>`n"
     }
     
+    # Add Windows Features link
+    if ($Script:WindowsFeatures -and $Script:WindowsFeatures.Count -gt 0) {
+        $wfEnabled = @($Script:WindowsFeatures | Where-Object { $_.State -eq 'Enabled' }).Count
+        $html += "                <li><a href='#windows-features'>Windows Features ($wfEnabled enabled / $($Script:WindowsFeatures.Count))</a></li>`n"
+    }
+    
     # Add Software Inventory link if inventory exists
     if ($Script:SoftwareInventory -and $Script:SoftwareInventory.Count -gt 0) {
         $html += "                <li><a href='#software-inventory'>Software Inventory ($($Script:SoftwareInventory.Count))</a></li>`n"
@@ -6252,6 +6363,84 @@ function New-HtmlReport {
 "@
     }
 
+    # Add Windows Features Inventory Section
+    if ($Script:WindowsFeatures -and $Script:WindowsFeatures.Count -gt 0) {
+        $enabledCount = @($Script:WindowsFeatures | Where-Object { $_.State -eq 'Enabled' }).Count
+        $html += @"
+        
+        <div class="section" id="windows-features">
+            <div class="section-header"> Windows Optional Features ($($Script:WindowsFeatures.Count) total, $enabledCount enabled)</div>
+            <div class="inventory-filter">
+                <input type="text" id="featureSearch" placeholder="Search features..." onkeyup="filterFeatures()">
+                <select id="featureStateFilter" onchange="filterFeatures()">
+                    <option value="">All States</option>
+                    <option value="Enabled">Enabled</option>
+                    <option value="Disabled">Disabled</option>
+                </select>
+                <select id="featureRiskFilter" onchange="filterFeatures()">
+                    <option value="">All Risk Levels</option>
+                    <option value="High">High Risk</option>
+                    <option value="Medium">Medium Risk</option>
+                    <option value="Low">Low Risk</option>
+                    <option value="Info">Info</option>
+                    <option value="flagged">Any Flagged</option>
+                </select>
+            </div>
+            <div class="inventory-wrapper">
+                <table class="inventory-table" id="featuresTable">
+                    <thead>
+                        <tr>
+                            <th>Feature Name</th>
+                            <th>State</th>
+                            <th>Security Risk</th>
+                            <th>Notes</th>
+                            <th>Restart Needed</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+        foreach ($feat in ($Script:WindowsFeatures | Sort-Object @{Expression={
+            switch ($_.SecurityRisk) { 'High' {0} 'Medium' {1} 'Low' {2} 'Info' {3} default {4} }
+        }}, @{Expression={$_.State -eq 'Disabled'}}, FeatureName)) {
+            $stateBadge = if ($feat.State -eq 'Enabled') {
+                "<span style='background: #28a745; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px;'>Enabled</span>"
+            } elseif ($feat.State -eq 'Disabled') {
+                "<span style='background: #6c757d; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px;'>Disabled</span>"
+            } else {
+                "<span style='padding: 2px 8px; border-radius: 4px; font-size: 11px; background: #ffc107; color: #333;'>$($feat.State)</span>"
+            }
+            
+            $riskBadge = switch ($feat.SecurityRisk) {
+                'High'   { "<span style='background: #dc3545; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px;'>High</span>" }
+                'Medium' { "<span style='background: #ffc107; color: #333; padding: 2px 8px; border-radius: 4px; font-size: 11px;'>Medium</span>" }
+                'Low'    { "<span style='background: #17a2b8; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px;'>Low</span>" }
+                'Info'   { "<span style='background: #28a745; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px;'>Info</span>" }
+                default  { "" }
+            }
+            
+            $rowStyle = ""
+            if ($feat.State -eq 'Enabled' -and $feat.SecurityRisk -eq 'High') {
+                $rowStyle = " style='background: #f8d7da;'"
+            } elseif ($feat.State -eq 'Enabled' -and $feat.SecurityRisk -eq 'Medium') {
+                $rowStyle = " style='background: #fff3cd;'"
+            }
+            
+            $html += "                        <tr$rowStyle data-state='$($feat.State)' data-risk='$($feat.SecurityRisk)'>`n"
+            $html += "                            <td style='font-family: monospace; font-size: 12px;'>$(ConvertTo-HtmlSafe $feat.FeatureName)</td>`n"
+            $html += "                            <td>$stateBadge</td>`n"
+            $html += "                            <td>$riskBadge</td>`n"
+            $html += "                            <td style='font-size: 12px;'>$(ConvertTo-HtmlSafe $feat.SecurityNote)</td>`n"
+            $html += "                            <td>$($feat.RestartNeeded)</td>`n"
+            $html += "                        </tr>`n"
+        }
+        $html += @"
+                    </tbody>
+                </table>
+            </div>
+        </div>
+"@
+    }
+
     # Add Software Inventory Section
     if ($Script:SoftwareInventory -and $Script:SoftwareInventory.Count -gt 0) {
         $twoYearsAgo = (Get-Date).AddDays(-730)
@@ -6319,6 +6508,32 @@ function New-HtmlReport {
         </div>
         
         <script>
+        function filterFeatures() {
+            var search = (document.getElementById('featureSearch') || {}).value || '';
+            search = search.toLowerCase();
+            var stateFilter = (document.getElementById('featureStateFilter') || {}).value || '';
+            var riskFilter = (document.getElementById('featureRiskFilter') || {}).value || '';
+            var rows = document.querySelectorAll('#featuresTable tbody tr');
+            
+            for (var i = 0; i < rows.length; i++) {
+                var name = (rows[i].cells[0] || {}).textContent || '';
+                var notes = (rows[i].cells[3] || {}).textContent || '';
+                var state = rows[i].getAttribute('data-state') || '';
+                var risk = rows[i].getAttribute('data-risk') || '';
+                
+                var show = true;
+                if (search && name.toLowerCase().indexOf(search) === -1 && notes.toLowerCase().indexOf(search) === -1) show = false;
+                if (stateFilter && state !== stateFilter) show = false;
+                if (riskFilter === 'flagged') {
+                    if (risk === 'None' || risk === '') show = false;
+                } else if (riskFilter && risk !== riskFilter) {
+                    show = false;
+                }
+                
+                rows[i].style.display = show ? '' : 'none';
+            }
+        }
+        
         function filterSoftware() {
             var searchText = document.getElementById('softwareSearch').value.toLowerCase();
             var archFilter = document.getElementById('archFilter').value;
@@ -6945,6 +7160,18 @@ function New-HtmlReport {
         })
     }
 
+    if ($Script:WindowsFeatures -and $Script:WindowsFeatures.Count -gt 0) {
+        $jsonExport['WindowsFeatures'] = @($Script:WindowsFeatures | ForEach-Object {
+            [ordered]@{
+                FeatureName   = $_.FeatureName
+                State         = $_.State
+                SecurityRisk  = $_.SecurityRisk
+                SecurityNote  = $_.SecurityNote
+                RestartNeeded = $_.RestartNeeded
+            }
+        })
+    }
+
     # Serialize JSON and sanitize only the </script> sequence to prevent premature tag close
     $embeddedJson = ($jsonExport | ConvertTo-Json -Depth 5) -replace '</script>', '</scr"+"ipt>'
 
@@ -7155,6 +7382,15 @@ function Export-JsonReport {
                 FileSystem = $_.FileSystem; TotalGB = $_.TotalGB; UsedGB = $_.UsedGB; FreeGB = $_.FreeGB
                 PercentFree = $_.PercentFree; PercentUsed = $_.PercentUsed; Compressed = $_.Compressed
                 BitLocker = $volEnc
+            }
+        })
+    }
+    
+    if ($Script:WindowsFeatures -and $Script:WindowsFeatures.Count -gt 0) {
+        $exportData['WindowsFeatures'] = @($Script:WindowsFeatures | ForEach-Object {
+            [ordered]@{
+                FeatureName = $_.FeatureName; State = $_.State
+                SecurityRisk = $_.SecurityRisk; SecurityNote = $_.SecurityNote
             }
         })
     }
