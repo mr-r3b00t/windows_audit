@@ -2511,27 +2511,199 @@ function Test-SecureBoot {
         Write-AuditLog "Could not query Device Guard status: $_" -Level "WARN"
     }
     
-    # Check TPM status
+    # Check TPM status - comprehensive
+    $Script:TPMInfo = $null
     try {
         $tpm = Get-Tpm -ErrorAction Stop
+        
+        # Get detailed TPM info from WMI
+        $tpmWmi = $null
+        try {
+            $tpmWmi = Get-CimInstance -Namespace "root\cimv2\Security\MicrosoftTpm" -ClassName Win32_Tpm -ErrorAction Stop
+        } catch { }
+        
+        # Build TPM info object
+        $tpmVersion = "Unknown"
+        $tpmManufacturer = "Unknown"
+        $tpmManufacturerId = ""
+        $tpmSpecVersion = ""
+        $tpmFirmware = ""
+        $tpmPhysicalPresenceVersionInfo = ""
+        
+        if ($tpmWmi) {
+            # Spec version string (e.g. "2.0, 0, 1.59")
+            if ($tpmWmi.SpecVersion) {
+                $tpmSpecVersion = $tpmWmi.SpecVersion
+                if ($tpmWmi.SpecVersion -match '^(\d+\.\d+)') {
+                    $tpmVersion = $Matches[1]
+                }
+            }
+            
+            # Manufacturer
+            if ($tpmWmi.ManufacturerIdTxt) {
+                $tpmManufacturer = $tpmWmi.ManufacturerIdTxt
+            } elseif ($tpmWmi.ManufacturerId) {
+                $tpmManufacturerId = $tpmWmi.ManufacturerId
+                # Common manufacturer IDs
+                $tpmManufacturer = switch ($tpmManufacturerId) {
+                    1229346816 { "Infineon" }
+                    1398033696 { "STMicroelectronics" }
+                    1112687437 { "Broadcom" }
+                    1095582720 { "Atmel" }
+                    1314145024 { "Nuvoton" }
+                    1196379975 { "Google (Cr50/Ti50)" }
+                    1296651087 { "Microsoft (fTPM/Pluton)" }
+                    1095844163 { "AMD (fTPM)" }
+                    1229870147 { "Intel (PTT)" }
+                    1314079556 { "NationZ" }
+                    default { "ID: $tpmManufacturerId" }
+                }
+            }
+            
+            # Firmware version
+            if ($tpmWmi.ManufacturerVersion) {
+                $tpmFirmware = $tpmWmi.ManufacturerVersion
+            }
+            
+            # Physical Presence Interface version
+            if ($tpmWmi.PhysicalPresenceVersionInfo) {
+                $tpmPhysicalPresenceVersionInfo = $tpmWmi.PhysicalPresenceVersionInfo
+            }
+        }
+        
+        # Fallback version detection from registry
+        if ($tpmVersion -eq "Unknown") {
+            $tpmRegVer = Get-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Services\TPM\WMI" -Name "SpecVersion" -Default $null
+            if ($tpmRegVer) { $tpmSpecVersion = $tpmRegVer; if ($tpmRegVer -match '^(\d+\.\d+)') { $tpmVersion = $Matches[1] } }
+        }
+        
+        # Check TPM-related registry settings
+        $tpmOwnerAuth = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\TPM" -Name "OSManagedAuthLevel" -Default $null
+        $tpmAuthLevel = switch ($tpmOwnerAuth) {
+            0 { "None" }
+            2 { "Delegated" }
+            4 { "Full" }
+            default { if ($null -eq $tpmOwnerAuth) { "Not configured (default)" } else { "Unknown ($tpmOwnerAuth)" } }
+        }
+        
+        # Check if TPM lockout is configured
+        $tpmLockoutThreshold = $null
+        $tpmLockoutDuration = $null
+        $tpmLockoutRecovery = $null
+        if ($tpmWmi) {
+            try {
+                # GetLockoutRecoveryInfo if available
+                $tpmLockoutThreshold = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\TPM" -Name "StandardUserAuthorizationFailureIndividualThreshold" -Default $null
+                $tpmLockoutDuration = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\TPM" -Name "StandardUserAuthorizationFailureTotalThreshold" -Default $null
+                $tpmLockoutRecovery = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\TPM" -Name "StandardUserAuthorizationFailureDuration" -Default $null
+            } catch { }
+        }
+        
+        # Check for TPM vulnerability indicators
+        $tpmVulnerable = $false
+        $tpmVulnDetails = @()
+        
+        # ROCA vulnerability (CVE-2017-15361) affects Infineon TPMs with certain firmware
+        if ($tpmManufacturer -match "Infineon") {
+            $tpmVulnDetails += "Infineon TPM detected - verify firmware is patched for ROCA vulnerability (CVE-2017-15361)"
+            $tpmVulnerable = $true
+        }
+        
+        # TPM 1.2 is considered weaker
+        if ($tpmVersion -match "^1\.") {
+            $tpmVulnDetails += "TPM 1.2 uses SHA-1 which is deprecated - TPM 2.0 is recommended"
+            $tpmVulnerable = $true
+        }
+        
+        # Check if TPM clear has been blocked
+        $blockTpmClear = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\TPM" -Name "BlockTpmClear" -Default $null
+        
+        # Check TPM auto-provisioning
+        $tpmAutoProvision = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\TPM" -Name "AllowClearAfterWindowsInstall" -Default $null
+        
+        # Store for HTML/JSON
+        $Script:TPMInfo = [PSCustomObject]@{
+            Present        = $tpm.TpmPresent
+            Ready          = $tpm.TpmReady
+            Enabled        = $tpm.TpmEnabled
+            Activated      = $tpm.TpmActivated
+            Owned          = $tpm.TpmOwned
+            Version        = $tpmVersion
+            SpecVersion    = $tpmSpecVersion
+            Manufacturer   = $tpmManufacturer
+            FirmwareVersion = $tpmFirmware
+            PPIVersion     = $tpmPhysicalPresenceVersionInfo
+            OwnerAuth      = $tpmAuthLevel
+            BlockClear     = $blockTpmClear
+            IsVulnerable   = $tpmVulnerable
+        }
+        
+        # Build detail string
+        $detailLines = @(
+            "Present: $($tpm.TpmPresent)",
+            "Ready: $($tpm.TpmReady)",
+            "Enabled: $($tpm.TpmEnabled)",
+            "Activated: $($tpm.TpmActivated)",
+            "Owned: $($tpm.TpmOwned)",
+            "TPM Version: $tpmVersion",
+            "Spec Version: $tpmSpecVersion",
+            "Manufacturer: $tpmManufacturer"
+        )
+        if ($tpmFirmware) { $detailLines += "Firmware: $tpmFirmware" }
+        if ($tpmPhysicalPresenceVersionInfo) { $detailLines += "PPI Version: $tpmPhysicalPresenceVersionInfo" }
+        $detailLines += "Owner Authorization: $tpmAuthLevel"
+        if ($null -ne $blockTpmClear) { $detailLines += "Block TPM Clear: $(if ($blockTpmClear -eq 1) { 'Yes' } else { 'No' })" }
+        if ($tpmLockoutThreshold) { $detailLines += "Lockout Threshold (per-user): $tpmLockoutThreshold" }
+        if ($tpmLockoutDuration) { $detailLines += "Lockout Threshold (total): $tpmLockoutDuration" }
+        if ($tpmLockoutRecovery) { $detailLines += "Lockout Duration (minutes): $tpmLockoutRecovery" }
+        
         if ($tpm.TpmPresent -and $tpm.TpmReady) {
             Add-Finding -Category "Hardware Security" -Name "TPM Status" -Risk "Info" `
-                -Description "TPM is present and ready" `
-                -Details "Present: $($tpm.TpmPresent), Ready: $($tpm.TpmReady), Enabled: $($tpm.TpmEnabled)"
+                -Description "TPM $tpmVersion is present and ready ($tpmManufacturer)" `
+                -Details ($detailLines -join "`n")
+            
+            # Version check
+            if ($tpmVersion -match "^1\.") {
+                Add-Finding -Category "Hardware Security" -Name "TPM Version 1.2 Detected" -Risk "Medium" `
+                    -Description "TPM 1.2 uses SHA-1 hashing which is cryptographically weak - TPM 2.0 is required for Windows 11 and recommended for all systems" `
+                    -Details "TPM Version: $tpmVersion`nSHA-1 is vulnerable to collision attacks`nTPM 2.0 supports SHA-256 and is required for Credential Guard, Windows Hello, and measured boot" `
+                    -Recommendation "Upgrade to a TPM 2.0 module or enable fTPM 2.0 in BIOS if supported by the CPU" `
+                    -Reference "Microsoft: TPM 2.0 requirement for Windows 11"
+            }
+            
+            # Vulnerability check
+            if ($tpmVulnerable -and $tpmVulnDetails.Count -gt 0) {
+                Add-Finding -Category "Hardware Security" -Name "TPM Vulnerability Advisory" -Risk "Medium" `
+                    -Description "Potential TPM vulnerabilities detected" `
+                    -Details ($tpmVulnDetails -join "`n") `
+                    -Recommendation "Check manufacturer website for firmware updates" `
+                    -Reference "CVE-2017-15361 (ROCA)"
+            }
+            
         } elseif ($tpm.TpmPresent) {
-            Add-Finding -Category "Hardware Security" -Name "TPM Not Ready" -Risk "Low" `
-                -Description "TPM is present but not ready" `
-                -Details "Present: $($tpm.TpmPresent), Ready: $($tpm.TpmReady)" `
-                -Recommendation "Initialize TPM in BIOS/UEFI settings"
+            Add-Finding -Category "Hardware Security" -Name "TPM Not Ready" -Risk "Medium" `
+                -Description "TPM is present but not ready - security features depending on TPM will not function" `
+                -Details ($detailLines -join "`n") `
+                -Recommendation "Initialize and take ownership of the TPM in BIOS/UEFI settings or via tpm.msc"
         } else {
-            Add-Finding -Category "Hardware Security" -Name "No TPM Detected" -Risk "Low" `
-                -Description "No TPM detected on this system" `
+            Add-Finding -Category "Hardware Security" -Name "No TPM Detected" -Risk "Medium" `
+                -Description "No TPM detected - full disk encryption, measured boot, and credential protection are limited" `
                 -Details "TPM not present" `
-                -Recommendation "TPM is recommended for full disk encryption and attestation"
+                -Recommendation "Enable fTPM in BIOS (Intel PTT / AMD fTPM) or install a discrete TPM 2.0 module"
         }
+        
+        # Owner auth policy check
+        if ($null -ne $tpmOwnerAuth -and $tpmOwnerAuth -eq 0) {
+            Add-Finding -Category "Hardware Security" -Name "TPM Owner Auth Not Stored" -Risk "Low" `
+                -Description "OS-managed TPM authorization level is set to None - OS will not store TPM owner authorization" `
+                -Details "OSManagedAuthLevel: $tpmOwnerAuth ($tpmAuthLevel)" `
+                -Recommendation "Consider setting to Delegated (2) or Full (4) for easier TPM management"
+        }
+        
     } catch {
         Add-Finding -Category "Hardware Security" -Name "TPM Status Unknown" -Risk "Info" `
-            -Description "Could not determine TPM status"
+            -Description "Could not determine TPM status - Get-Tpm cmdlet may require admin privileges" `
+            -Details "Error: $($_.Exception.Message)"
     }
     
     # Check CPU vulnerability mitigations (Spectre/Meltdown)
@@ -5484,6 +5656,45 @@ function New-HtmlReport {
         </div>
 "@
 
+    # Add TPM Information Section
+    if ($Script:TPMInfo) {
+        $tpmStatusBadge = if ($Script:TPMInfo.Present -and $Script:TPMInfo.Ready) {
+            "<span style='background: #28a745; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px;'>Ready</span>"
+        } elseif ($Script:TPMInfo.Present) {
+            "<span style='background: #ffc107; color: #333; padding: 2px 10px; border-radius: 4px; font-size: 12px;'>Present - Not Ready</span>"
+        } else {
+            "<span style='background: #dc3545; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px;'>Not Detected</span>"
+        }
+        
+        $tpmVerBadge = ""
+        if ($Script:TPMInfo.Version -match "^2\.") {
+            $tpmVerBadge = "<span style='background: #28a745; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px; margin-left: 6px;'>v$($Script:TPMInfo.Version)</span>"
+        } elseif ($Script:TPMInfo.Version -match "^1\.") {
+            $tpmVerBadge = "<span style='background: #dc3545; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px; margin-left: 6px;'>v$($Script:TPMInfo.Version) - Upgrade Recommended</span>"
+        }
+        
+        $html += @"
+        
+        <div class="section">
+            <div class="section-header"> TPM Information &nbsp;$tpmStatusBadge$tpmVerBadge</div>
+            <div class="system-info-grid">
+                <div class="system-info-item"><span class="label">TPM Present</span><span class="value">$($Script:TPMInfo.Present)</span></div>
+                <div class="system-info-item"><span class="label">TPM Ready</span><span class="value">$($Script:TPMInfo.Ready)</span></div>
+                <div class="system-info-item"><span class="label">TPM Enabled</span><span class="value">$($Script:TPMInfo.Enabled)</span></div>
+                <div class="system-info-item"><span class="label">TPM Activated</span><span class="value">$($Script:TPMInfo.Activated)</span></div>
+                <div class="system-info-item"><span class="label">TPM Owned</span><span class="value">$($Script:TPMInfo.Owned)</span></div>
+                <div class="system-info-item"><span class="label">TPM Version</span><span class="value">$(ConvertTo-HtmlSafe $Script:TPMInfo.Version)</span></div>
+                <div class="system-info-item"><span class="label">Spec Version</span><span class="value">$(ConvertTo-HtmlSafe $Script:TPMInfo.SpecVersion)</span></div>
+                <div class="system-info-item"><span class="label">Manufacturer</span><span class="value">$(ConvertTo-HtmlSafe $Script:TPMInfo.Manufacturer)</span></div>
+                <div class="system-info-item"><span class="label">Firmware Version</span><span class="value">$(ConvertTo-HtmlSafe $Script:TPMInfo.FirmwareVersion)</span></div>
+                <div class="system-info-item"><span class="label">PPI Version</span><span class="value">$(ConvertTo-HtmlSafe $Script:TPMInfo.PPIVersion)</span></div>
+                <div class="system-info-item"><span class="label">Owner Authorization</span><span class="value">$(ConvertTo-HtmlSafe $Script:TPMInfo.OwnerAuth)</span></div>
+                <div class="system-info-item"><span class="label">Block TPM Clear</span><span class="value">$(if ($null -ne $Script:TPMInfo.BlockClear) { if ($Script:TPMInfo.BlockClear -eq 1) { 'Yes (Policy)' } else { 'No' } } else { 'Not configured' })</span></div>
+            </div>
+        </div>
+"@
+    }
+
     # Add Software Inventory Section
     if ($Script:SoftwareInventory -and $Script:SoftwareInventory.Count -gt 0) {
         $twoYearsAgo = (Get-Date).AddDays(-730)
@@ -6022,6 +6233,23 @@ function New-HtmlReport {
             Uptime       = $Script:SystemInfo.Uptime
             LastBoot     = $Script:SystemInfo.LastBoot
         }
+        TPM = if ($Script:TPMInfo) {
+            [ordered]@{
+                Present         = $Script:TPMInfo.Present
+                Ready           = $Script:TPMInfo.Ready
+                Enabled         = $Script:TPMInfo.Enabled
+                Activated       = $Script:TPMInfo.Activated
+                Owned           = $Script:TPMInfo.Owned
+                Version         = $Script:TPMInfo.Version
+                SpecVersion     = $Script:TPMInfo.SpecVersion
+                Manufacturer    = $Script:TPMInfo.Manufacturer
+                FirmwareVersion = $Script:TPMInfo.FirmwareVersion
+                PPIVersion      = $Script:TPMInfo.PPIVersion
+                OwnerAuth       = $Script:TPMInfo.OwnerAuth
+                BlockClear      = $Script:TPMInfo.BlockClear
+                IsVulnerable    = $Script:TPMInfo.IsVulnerable
+            }
+        } else { $null }
         Summary = [ordered]@{
             TotalFindings = $Script:Findings.Count
             Critical      = @($Script:Findings | Where-Object { $_.Risk -eq 'Critical' }).Count
@@ -6190,6 +6418,8 @@ function Export-JsonReport {
         }
         
         SystemInformation = $Script:SystemInfo
+        
+        TPM = if ($Script:TPMInfo) { $Script:TPMInfo } else { $null }
         
         Summary = [ordered]@{
             TotalFindings = $Script:Findings.Count
