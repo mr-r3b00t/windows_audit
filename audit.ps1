@@ -2261,6 +2261,70 @@ function Test-PrivilegeEscalation {
     }
     
     # Note: WSUS HTTP vulnerability is checked in Test-UpdateStatus
+    
+    # Check Co-installer Settings (Device Installation)
+    $coInstallerDisabled = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Installer" -Name "DisableCoInstallers" -Default 0
+    $deviceInstallPolicy = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Settings" -Name "DisableCoInstallers" -Default $null
+    
+    if ($coInstallerDisabled -eq 1 -or $deviceInstallPolicy -eq 1) {
+        Add-Finding -Category "Privilege Escalation" -Name "Device Co-installers Disabled" -Risk "Info" `
+            -Description "Device co-installers are disabled - reduces attack surface from third-party driver installers" `
+            -Details "Registry: $coInstallerDisabled, Policy: $deviceInstallPolicy"
+    } else {
+        Add-Finding -Category "Privilege Escalation" -Name "Device Co-installers Enabled" -Risk "Medium" `
+            -Description "Device co-installers are enabled - third-party co-installers run as SYSTEM during device installation" `
+            -Details "DisableCoInstallers not set or set to 0" `
+            -Recommendation "Consider disabling co-installers via Group Policy (Computer Configuration > Admin Templates > Windows Components > Device Installation) or set HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Installer\DisableCoInstallers = 1" `
+            -Reference "Microsoft Security Guidance - Device Installation Settings"
+    }
+    
+    # Check Device Installation Restrictions
+    $denyDeviceIDs = Test-RegistryPathExists -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions\DenyDeviceIDs"
+    $denyDeviceClasses = Test-RegistryPathExists -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions\DenyDeviceClasses"
+    $denyAll = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions" -Name "DenyAll" -Default 0
+    
+    if ($denyAll -eq 1 -or $denyDeviceIDs -or $denyDeviceClasses) {
+        $details = @()
+        if ($denyAll -eq 1) { $details += "DenyAll: Enabled" }
+        if ($denyDeviceIDs) { $details += "Device ID restrictions: Configured" }
+        if ($denyDeviceClasses) { $details += "Device class restrictions: Configured" }
+        Add-Finding -Category "Privilege Escalation" -Name "Device Installation Restrictions" -Risk "Info" `
+            -Description "Device installation restrictions are configured" `
+            -Details ($details -join "`n")
+    } else {
+        Add-Finding -Category "Privilege Escalation" -Name "No Device Installation Restrictions" -Risk "Low" `
+            -Description "No device installation restrictions are configured - any device class can be installed" `
+            -Details "DenyAll: Not set, No DenyDeviceIDs or DenyDeviceClasses policies" `
+            -Recommendation "Consider restricting device installation to approved device classes via Group Policy"
+    }
+    
+    # Check Autologon credentials
+    $autoLogonEnabled = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "AutoAdminLogon" -Default "0"
+    $autoLogonUser = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "DefaultUserName" -Default ""
+    $autoLogonDomain = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "DefaultDomainName" -Default ""
+    $autoLogonPassword = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "DefaultPassword" -Default $null
+    # Also check for LSA Secrets stored autologon (no cleartext password in registry)
+    $autoLogonCount = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -Name "AutoLogonCount" -Default $null
+    
+    if ($autoLogonEnabled -eq "1") {
+        if ($autoLogonPassword) {
+            Add-Finding -Category "Privilege Escalation" -Name "Autologon with Cleartext Password" -Risk "Critical" `
+                -Description "Autologon is enabled with a cleartext password stored in the registry - any local user can read it" `
+                -Details "AutoAdminLogon: Enabled`nUser: $autoLogonDomain\$autoLogonUser`nDefaultPassword: Present in HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon (cleartext!)" `
+                -Recommendation "Disable autologon or use the Sysinternals Autologon tool which encrypts the password in LSA Secrets instead of storing it in cleartext" `
+                -Reference "MITRE ATT&CK T1552.002 - Unsecured Credentials: Credentials in Registry"
+        } else {
+            Add-Finding -Category "Privilege Escalation" -Name "Autologon Enabled" -Risk "Medium" `
+                -Description "Autologon is enabled - system automatically logs in without requiring a password at the console" `
+                -Details "AutoAdminLogon: Enabled`nUser: $autoLogonDomain\$autoLogonUser`nPassword: Stored in LSA Secrets (not cleartext)$(if ($autoLogonCount) { "`nAutoLogonCount: $autoLogonCount (remaining auto-logons)" })" `
+                -Recommendation "Disable autologon unless required for kiosk/dedicated systems. Ensure physical access is controlled." `
+                -Reference "MITRE ATT&CK T1552.002"
+        }
+    } else {
+        Add-Finding -Category "Privilege Escalation" -Name "Autologon Disabled" -Risk "Info" `
+            -Description "Autologon is not enabled" `
+            -Details "AutoAdminLogon: $autoLogonEnabled"
+    }
 }
 
 function Test-SecureBoot {
@@ -4353,6 +4417,200 @@ function Test-TelemetryPrivacy {
     }
 }
 
+function Test-SystemToolAccess {
+    Write-AuditLog "Checking System Tool Access for Low-Privileged Users..." -Level "INFO"
+    
+    # LOLBins - Living Off The Land Binaries that can be abused for execution, download, or bypass
+    $lolbins = @(
+        @{ Name = "certutil.exe";    Risk = "High";   Reason = "Can download files, encode/decode, and bypass application controls" }
+        @{ Name = "mshta.exe";       Risk = "High";   Reason = "Executes HTA files containing scripts - common initial access vector" }
+        @{ Name = "msbuild.exe";     Risk = "High";   Reason = "Can compile and execute arbitrary C# code inline from project files" }
+        @{ Name = "regsvr32.exe";    Risk = "Medium"; Reason = "Can load remote scriptlets (SCT) to bypass AppLocker" }
+        @{ Name = "rundll32.exe";    Risk = "Medium"; Reason = "Can execute DLL exports and JavaScript via advpack" }
+        @{ Name = "cscript.exe";     Risk = "Medium"; Reason = "Windows Script Host - executes VBScript/JScript" }
+        @{ Name = "wscript.exe";     Risk = "Medium"; Reason = "Windows Script Host GUI - executes VBScript/JScript" }
+        @{ Name = "bitsadmin.exe";   Risk = "Medium"; Reason = "Can download files and create persistent jobs" }
+        @{ Name = "certreq.exe";     Risk = "Medium"; Reason = "Can download files via certificate enrollment" }
+        @{ Name = "esentutl.exe";    Risk = "Low";    Reason = "Can copy locked files (SAM, NTDS.dit)" }
+        @{ Name = "expand.exe";      Risk = "Low";    Reason = "Can extract CAB files, used for payload staging" }
+        @{ Name = "extrac32.exe";    Risk = "Low";    Reason = "Can extract CAB files, used for payload staging" }
+        @{ Name = "findstr.exe";     Risk = "Low";    Reason = "Can download files via SMB UNC paths" }
+        @{ Name = "hh.exe";          Risk = "Medium"; Reason = "HTML Help - can execute scripts from CHM files" }
+        @{ Name = "installutil.exe"; Risk = "High";   Reason = "Can execute arbitrary code via .NET assembly uninstall methods" }
+        @{ Name = "msconfig.exe";    Risk = "Low";    Reason = "Can be used to access system configuration and startup items" }
+        @{ Name = "msiexec.exe";     Risk = "Medium"; Reason = "Can install remote MSI packages including malicious ones" }
+        @{ Name = "nltest.exe";      Risk = "Medium"; Reason = "Domain trust enumeration tool useful for reconnaissance" }
+        @{ Name = "presentationhost.exe"; Risk = "Medium"; Reason = "Can execute XAML browser applications (XBAPs)" }
+        @{ Name = "reg.exe";         Risk = "Low";    Reason = "Can export registry hives including SAM for offline cracking" }
+        @{ Name = "sc.exe";          Risk = "Medium"; Reason = "Service control - can create/modify services if permissions allow" }
+        @{ Name = "schtasks.exe";    Risk = "Medium"; Reason = "Can create scheduled tasks for persistence" }
+    )
+    
+    $accessible = @()
+    $highRiskAccessible = @()
+    
+    foreach ($tool in $lolbins) {
+        $paths = @()
+        # Check common locations
+        $sysPath = Join-Path $env:SystemRoot "System32\$($tool.Name)"
+        $sysWow = Join-Path $env:SystemRoot "SysWOW64\$($tool.Name)"
+        
+        if (Test-Path $sysPath) { $paths += $sysPath }
+        if (Test-Path $sysWow) { $paths += $sysWow }
+        
+        # For .NET tools, check framework dirs
+        if ($tool.Name -in @("msbuild.exe", "installutil.exe")) {
+            $fwPaths = @(
+                "$env:SystemRoot\Microsoft.NET\Framework\v4.0.30319\$($tool.Name)",
+                "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\$($tool.Name)"
+            )
+            foreach ($fp in $fwPaths) {
+                if (Test-Path $fp) { $paths += $fp }
+            }
+        }
+        
+        foreach ($toolPath in $paths) {
+            try {
+                $acl = Get-Acl -Path $toolPath -ErrorAction SilentlyContinue
+                if ($acl) {
+                    # Check if Users or Everyone can execute
+                    $canExecute = $false
+                    foreach ($access in $acl.Access) {
+                        if ($access.IdentityReference -match 'BUILTIN\\Users|Everyone|Authenticated Users' -and
+                            $access.FileSystemRights -match 'ReadAndExecute|FullControl' -and
+                            $access.AccessControlType -eq 'Allow') {
+                            $canExecute = $true
+                            break
+                        }
+                    }
+                    
+                    if ($canExecute) {
+                        $accessible += [PSCustomObject]@{
+                            Name   = $tool.Name
+                            Path   = $toolPath
+                            Risk   = $tool.Risk
+                            Reason = $tool.Reason
+                        }
+                        if ($tool.Risk -eq "High") {
+                            $highRiskAccessible += $tool.Name
+                        }
+                    }
+                }
+            } catch { }
+        }
+    }
+    
+    if ($highRiskAccessible.Count -gt 0) {
+        $uniqueHigh = $highRiskAccessible | Select-Object -Unique
+        Add-Finding -Category "System Tool Access" -Name "High-Risk LOLBins Accessible" -Risk "Medium" `
+            -Description "$($uniqueHigh.Count) high-risk Living Off The Land Binaries are accessible to standard users" `
+            -Details "Accessible high-risk tools:`n$(($uniqueHigh | ForEach-Object { "  $_ - $(($accessible | Where-Object { $_.Name -eq $_ } | Select-Object -First 1).Reason)" }) -join "`n")" `
+            -Recommendation "Consider using AppLocker or WDAC to block execution of unnecessary LOLBins for standard users. High-priority targets: certutil, mshta, msbuild, installutil." `
+            -Reference "LOLBAS Project - https://lolbas-project.github.io/"
+    }
+    
+    $totalAccessible = ($accessible | Select-Object -ExpandProperty Name -Unique).Count
+    Add-Finding -Category "System Tool Access" -Name "LOLBin Inventory" -Risk "Info" `
+        -Description "Living Off The Land Binary accessibility assessment" `
+        -Details "Total LOLBins checked: $($lolbins.Count)`nAccessible to standard users: $totalAccessible`nHigh risk accessible: $(($highRiskAccessible | Select-Object -Unique).Count)"
+    
+    # Check if AppLocker or WDAC is providing any mitigation
+    $appLockerSvc = Get-Service -Name "AppIDSvc" -ErrorAction SilentlyContinue
+    $wdacEnforced = Get-RegistryValue -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CI" -Name "UMCIAuditMode" -Default $null
+    
+    if ((-not $appLockerSvc -or $appLockerSvc.Status -ne 'Running') -and $null -eq $wdacEnforced) {
+        if ($highRiskAccessible.Count -gt 0) {
+            Add-Finding -Category "System Tool Access" -Name "No Application Control Active" -Risk "Medium" `
+                -Description "Neither AppLocker nor WDAC appears active - LOLBins are unrestricted" `
+                -Details "AppLocker service: $(if ($appLockerSvc) { $appLockerSvc.Status } else { 'Not found' })`nWDAC: Not detected" `
+                -Recommendation "Deploy AppLocker or WDAC to restrict execution of unnecessary system tools"
+        }
+    }
+}
+
+function Test-WindowsRecall {
+    Write-AuditLog "Checking Windows Recall / AI Settings..." -Level "INFO"
+    
+    # Windows Recall takes periodic screenshots and uses AI to make them searchable
+    # Significant privacy and security concern - screenshots can capture passwords, sensitive data
+    
+    $recallFindings = @()
+    
+    # Check if Recall feature is present (Windows 11 24H2+ Copilot+ PCs)
+    $recallAppPath = "$env:ProgramFiles\WindowsApps"
+    $recallPresent = $false
+    
+    if (Test-Path $recallAppPath) {
+        try {
+            $recallPkg = Get-ChildItem -Path $recallAppPath -Filter "*Recall*" -Directory -ErrorAction SilentlyContinue
+            if ($recallPkg) { $recallPresent = $true }
+        } catch { }
+    }
+    
+    # Check via registry - multiple possible locations
+    $recallEnabled = Get-RegistryValue -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Recall" -Name "Enabled" -Default $null
+    $recallDisabledPolicy = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" -Name "DisableAIDataAnalysis" -Default 0
+    $turnOffSavingSnapshots = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" -Name "TurnOffSavingSnapshots" -Default $null
+    
+    # Check the user-level setting
+    $recallUserDisabled = Get-RegistryValue -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Recall" -Name "DisableRecall" -Default $null
+    
+    # Check for Recall database presence (indicates it has been active)
+    $recallDbPaths = @()
+    $userProfiles = Get-ChildItem -Path "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin @('Public', 'Default', 'Default User', 'All Users') }
+    foreach ($profile in $userProfiles) {
+        $dbPath = Join-Path $profile.FullName "AppData\Local\CoreAIPlatform.00\UKP"
+        if (Test-Path $dbPath) {
+            $recallDbPaths += "$($profile.Name): $dbPath"
+        }
+    }
+    
+    # Also check for the Recall settings in newer builds
+    $screenCapture = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" -Name "AllowRecallEnablement" -Default $null
+    
+    if ($recallDisabledPolicy -eq 1 -or $turnOffSavingSnapshots -eq 1) {
+        Add-Finding -Category "Privacy" -Name "Windows Recall Disabled by Policy" -Risk "Info" `
+            -Description "Windows Recall / AI screenshot capture is disabled via Group Policy" `
+            -Details "DisableAIDataAnalysis: $recallDisabledPolicy`nTurnOffSavingSnapshots: $turnOffSavingSnapshots"
+    } elseif ($screenCapture -eq 0) {
+        Add-Finding -Category "Privacy" -Name "Windows Recall Blocked by Policy" -Risk "Info" `
+            -Description "Windows Recall enablement is blocked via AllowRecallEnablement policy" `
+            -Details "AllowRecallEnablement: 0"
+    } elseif ($recallDbPaths.Count -gt 0) {
+        Add-Finding -Category "Privacy" -Name "Windows Recall Database Found" -Risk "High" `
+            -Description "Windows Recall snapshot database found - periodic screenshots of all activity are being stored locally" `
+            -Details "Recall databases found:`n$($recallDbPaths -join "`n")`n`nRecall captures screenshots every few seconds, including passwords, banking info, private messages, and sensitive documents. The database is stored unencrypted on disk." `
+            -Recommendation "Disable Windows Recall via Settings > Privacy & Security > Recall, or enforce via Group Policy: Computer Configuration > Admin Templates > Windows Components > Windows AI > Turn off saving snapshots for Windows. Consider deleting existing snapshot data." `
+            -Reference "CVE-2024-5563 - Windows Recall Privacy Concerns"
+    } elseif ($recallPresent -or $recallEnabled -eq 1) {
+        $status = if ($recallEnabled -eq 1) { "Enabled in registry" } else { "Package present but enablement status unknown" }
+        Add-Finding -Category "Privacy" -Name "Windows Recall Present" -Risk "Medium" `
+            -Description "Windows Recall feature is present on this system" `
+            -Details "Status: $status`nUser disabled: $recallUserDisabled`nPolicy disabled: $recallDisabledPolicy`n`nRecall captures periodic screenshots and uses AI to make them searchable. This can expose passwords, sensitive data, and private communications." `
+            -Recommendation "If Recall is not required, disable it via Group Policy: Set 'Turn off saving snapshots for Windows' to Enabled, or set HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsAI\DisableAIDataAnalysis = 1" `
+            -Reference "Microsoft Windows Recall Security Documentation"
+    } else {
+        Add-Finding -Category "Privacy" -Name "Windows Recall Status" -Risk "Info" `
+            -Description "Windows Recall does not appear to be present or active" `
+            -Details "Recall package: Not detected`nRecall databases: None found`nDisableAIDataAnalysis policy: $recallDisabledPolicy"
+    }
+    
+    # Check for other AI features that may have privacy implications
+    $copilotDisabled = Get-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" -Name "TurnOffWindowsCopilot" -Default 0
+    $copilotUserDisabled = Get-RegistryValue -Path "HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot" -Name "TurnOffWindowsCopilot" -Default 0
+    
+    if ($copilotDisabled -ne 1 -and $copilotUserDisabled -ne 1) {
+        Add-Finding -Category "Privacy" -Name "Windows Copilot Enabled" -Risk "Info" `
+            -Description "Windows Copilot is not disabled by policy" `
+            -Details "TurnOffWindowsCopilot (HKLM): $copilotDisabled`nTurnOffWindowsCopilot (HKCU): $copilotUserDisabled" `
+            -Recommendation "Consider disabling Windows Copilot via Group Policy if not required for business use"
+    } else {
+        Add-Finding -Category "Privacy" -Name "Windows Copilot Disabled" -Risk "Info" `
+            -Description "Windows Copilot is disabled by policy" `
+            -Details "TurnOffWindowsCopilot (HKLM): $copilotDisabled`nTurnOffWindowsCopilot (HKCU): $copilotUserDisabled"
+    }
+}
+
 function Test-CredentialCaching {
     Write-AuditLog "Checking Credential Caching Settings..." -Level "INFO"
     
@@ -5944,7 +6202,9 @@ function Start-SecurityAudit {
         { Test-DriverSigning },
         { Test-ShadowCopies },
         { Test-WindowsSubsystems },
-        { Test-TelemetryPrivacy }
+        { Test-TelemetryPrivacy },
+        { Test-SystemToolAccess },
+        { Test-WindowsRecall }
     )
     
     foreach ($module in $modules) {
