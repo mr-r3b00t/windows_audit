@@ -222,6 +222,119 @@ function Get-SystemInformation {
     $os = Get-SafeWmiObject -Class Win32_OperatingSystem
     $cs = Get-SafeWmiObject -Class Win32_ComputerSystem
     $bios = Get-SafeWmiObject -Class Win32_BIOS
+    $cpu = Get-SafeWmiObject -Class Win32_Processor
+    $gpu = Get-SafeWmiObject -Class Win32_VideoController
+    $baseboard = Get-SafeWmiObject -Class Win32_BaseBoard
+    
+    # Calculate uptime
+    $uptimeStr = "Unknown"
+    $lastBootStr = ""
+    try {
+        if ($os.LastBootUpTime) {
+            # Get-CimInstance returns DateTime directly; Get-WmiObject returns a string
+            $lastBoot = $null
+            if ($os.LastBootUpTime -is [DateTime]) {
+                $lastBoot = $os.LastBootUpTime
+            } else {
+                try { $lastBoot = [System.Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime) } catch { }
+            }
+            
+            if (-not $lastBoot) {
+                try { $lastBoot = [DateTime]::Parse($os.LastBootUpTime.ToString()) } catch { }
+            }
+            
+            if ($lastBoot) {
+                $uptime = (Get-Date) - $lastBoot
+                $lastBootStr = $lastBoot.ToString('yyyy-MM-dd HH:mm:ss')
+                
+                if ($uptime.TotalDays -ge 60) {
+                    $months = [math]::Floor($uptime.TotalDays / 30)
+                    $remDays = [math]::Floor($uptime.TotalDays % 30)
+                    $uptimeStr = "$months months, $remDays days"
+                } elseif ($uptime.TotalDays -ge 1) {
+                    $days = [math]::Floor($uptime.TotalDays)
+                    $hours = $uptime.Hours
+                    $uptimeStr = "$days days, $hours hours"
+                } else {
+                    $hours = [math]::Floor($uptime.TotalHours)
+                    $mins = $uptime.Minutes
+                    $uptimeStr = "$hours hours, $mins minutes"
+                }
+            }
+        }
+    } catch { }
+    
+    # BIOS release date
+    $biosDate = ""
+    try {
+        if ($bios.ReleaseDate) {
+            if ($bios.ReleaseDate -is [DateTime]) {
+                $biosDate = $bios.ReleaseDate.ToString('yyyy-MM-dd')
+            } else {
+                try {
+                    $biosDate = ([System.Management.ManagementDateTimeConverter]::ToDateTime($bios.ReleaseDate)).ToString('yyyy-MM-dd')
+                } catch {
+                    try { $biosDate = ([DateTime]::Parse($bios.ReleaseDate.ToString())).ToString('yyyy-MM-dd') } catch { }
+                }
+            }
+        }
+    } catch { }
+    
+    # CPU details - handle array or single
+    $cpuName = ""; $cpuCores = ""; $cpuThreads = ""; $cpuSpeed = ""
+    if ($cpu) {
+        $cpuObj = if ($cpu -is [array]) { $cpu[0] } else { $cpu }
+        $cpuName = $cpuObj.Name -replace '\s+', ' '
+        $cpuCores = $cpuObj.NumberOfCores
+        $cpuThreads = $cpuObj.NumberOfLogicalProcessors
+        $cpuSpeed = "$([math]::Round($cpuObj.MaxClockSpeed / 1000, 2)) GHz"
+        if ($cpu -is [array] -and $cpu.Count -gt 1) {
+            $cpuName = "$cpuName (x$($cpu.Count) sockets)"
+        }
+    }
+    
+    # GPU details - may have multiple
+    $gpuDetails = @()
+    if ($gpu) {
+        $gpuList = if ($gpu -is [array]) { $gpu } else { @($gpu) }
+        foreach ($g in $gpuList) {
+            $vram = ""
+            if ($g.AdapterRAM -and $g.AdapterRAM -gt 0) {
+                $vramGB = [math]::Round($g.AdapterRAM / 1GB, 1)
+                # AdapterRAM is a UInt32, so max ~4GB. For larger GPUs the value wraps
+                if ($vramGB -le 0) { $vram = "N/A" }
+                else { $vram = "${vramGB} GB" }
+            }
+            $driverVer = if ($g.DriverVersion) { $g.DriverVersion } else { "N/A" }
+            $gpuDetails += [PSCustomObject]@{
+                Name       = $g.Name
+                VRAM       = $vram
+                Driver     = $driverVer
+                Resolution = if ($g.CurrentHorizontalResolution) { "$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution)" } else { "N/A" }
+            }
+        }
+    }
+    
+    # RAM details
+    $totalRAM = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+    $ramModules = @()
+    try {
+        $physMem = Get-SafeWmiObject -Class Win32_PhysicalMemory
+        if ($physMem) {
+            $memList = if ($physMem -is [array]) { $physMem } else { @($physMem) }
+            foreach ($m in $memList) {
+                $sizeGB = [math]::Round($m.Capacity / 1GB, 1)
+                $speed = if ($m.ConfiguredClockSpeed) { "$($m.ConfiguredClockSpeed) MHz" } elseif ($m.Speed) { "$($m.Speed) MHz" } else { "N/A" }
+                $type = switch ($m.SMBIOSMemoryType) {
+                    20 { "DDR" } 21 { "DDR2" } 24 { "DDR3" } 26 { "DDR4" } 34 { "DDR5" }
+                    default { 
+                        switch ($m.MemoryType) { 20 { "DDR" } 21 { "DDR2" } 22 { "DDR2" } 24 { "DDR3" } 26 { "DDR4" } default { "" } }
+                    }
+                }
+                $ramModules += "${sizeGB}GB $type $speed"
+            }
+        }
+    } catch { }
     
     $Script:SystemInfo = [PSCustomObject]@{
         Hostname        = $env:COMPUTERNAME
@@ -231,12 +344,21 @@ function Get-SystemInformation {
         OSBuild         = $os.BuildNumber
         Architecture    = $os.OSArchitecture
         InstallDate     = $os.InstallDate
-        LastBoot        = $os.LastBootUpTime
+        LastBoot        = $lastBootStr
+        Uptime          = $uptimeStr
         Manufacturer    = $cs.Manufacturer
         Model           = $cs.Model
+        Baseboard       = if ($baseboard) { "$($baseboard.Manufacturer) $($baseboard.Product)" } else { "N/A" }
         BIOSVersion     = $bios.SMBIOSBIOSVersion
+        BIOSDate        = $biosDate
         SerialNumber    = $bios.SerialNumber
-        TotalMemoryGB   = [math]::Round($cs.TotalPhysicalMemory / 1GB, 2)
+        CPU             = $cpuName
+        CPUCores        = $cpuCores
+        CPUThreads      = $cpuThreads
+        CPUMaxSpeed     = $cpuSpeed
+        TotalMemoryGB   = $totalRAM
+        RAMModules      = $ramModules
+        GPUs            = $gpuDetails
         CurrentUser     = "$env:USERDOMAIN\$env:USERNAME"
         IsAdmin         = Test-IsAdmin
         PowerShellVer   = $PSVersionTable.PSVersion.ToString()
@@ -248,6 +370,10 @@ function Get-SystemInformation {
     Add-Finding -Category "System Info" -Name "System Overview" -Risk "Info" `
         -Description "Basic system information collected" `
         -Details "OS: $($Script:SystemInfo.OSName) | Build: $($Script:SystemInfo.OSBuild) | Arch: $($Script:SystemInfo.Architecture)"
+    
+    Add-Finding -Category "System Info" -Name "Hardware Summary" -Risk "Info" `
+        -Description "Hardware identification and specification" `
+        -Details "Make/Model: $($Script:SystemInfo.Manufacturer) $($Script:SystemInfo.Model)`nSerial: $($Script:SystemInfo.SerialNumber)`nBIOS: $($Script:SystemInfo.BIOSVersion) ($($Script:SystemInfo.BIOSDate))`nCPU: $($Script:SystemInfo.CPU) ($($Script:SystemInfo.CPUCores)C/$($Script:SystemInfo.CPUThreads)T @ $($Script:SystemInfo.CPUMaxSpeed))`nRAM: $($Script:SystemInfo.TotalMemoryGB) GB$(if ($ramModules.Count -gt 0) { " [$($ramModules -join ' + ')]" })`nGPU: $(($gpuDetails | ForEach-Object { "$($_.Name) ($($_.VRAM))" }) -join '; ')`nUptime: $($Script:SystemInfo.Uptime) (since $lastBootStr)"
     
     # CRITICAL: Warn if not running as admin
     if (-not $Script:SystemInfo.IsAdmin) {
@@ -5318,10 +5444,42 @@ function New-HtmlReport {
                 <div class="system-info-item"><span class="label">Operating System</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.OSName)</span></div>
                 <div class="system-info-item"><span class="label">OS Build</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.OSBuild)</span></div>
                 <div class="system-info-item"><span class="label">Architecture</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.Architecture)</span></div>
-                <div class="system-info-item"><span class="label">Last Boot</span><span class="value">$($Script:SystemInfo.LastBoot)</span></div>
-                <div class="system-info-item"><span class="label">Total Memory</span><span class="value">$($Script:SystemInfo.TotalMemoryGB) GB</span></div>
                 <div class="system-info-item"><span class="label">PowerShell Version</span><span class="value">$($Script:SystemInfo.PowerShellVer)</span></div>
                 <div class="system-info-item"><span class="label">Running as Admin</span><span class="value">$adminStatusHtml</span></div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header"> Hardware Summary</div>
+            <div class="system-info-grid">
+                <div class="system-info-item"><span class="label">Make / Model</span><span class="value">$(ConvertTo-HtmlSafe "$($Script:SystemInfo.Manufacturer) $($Script:SystemInfo.Model)")</span></div>
+                <div class="system-info-item"><span class="label">Serial Number</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.SerialNumber)</span></div>
+                <div class="system-info-item"><span class="label">Baseboard</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.Baseboard)</span></div>
+                <div class="system-info-item"><span class="label">BIOS Version</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.BIOSVersion)</span></div>
+                <div class="system-info-item"><span class="label">BIOS Date</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.BIOSDate)</span></div>
+                <div class="system-info-item"><span class="label">CPU</span><span class="value">$(ConvertTo-HtmlSafe $Script:SystemInfo.CPU)</span></div>
+                <div class="system-info-item"><span class="label">CPU Cores / Threads</span><span class="value">$($Script:SystemInfo.CPUCores) Cores / $($Script:SystemInfo.CPUThreads) Threads @ $($Script:SystemInfo.CPUMaxSpeed)</span></div>
+                <div class="system-info-item"><span class="label">Total RAM</span><span class="value">$($Script:SystemInfo.TotalMemoryGB) GB$(if ($Script:SystemInfo.RAMModules.Count -gt 0) { " &nbsp;($($Script:SystemInfo.RAMModules.Count) module$(if ($Script:SystemInfo.RAMModules.Count -ne 1){'s'}): $(ConvertTo-HtmlSafe ($Script:SystemInfo.RAMModules -join ' + ')))" })</span></div>
+"@
+
+    # Add GPU rows - may have multiple
+    if ($Script:SystemInfo.GPUs -and $Script:SystemInfo.GPUs.Count -gt 0) {
+        $gpuIndex = 0
+        foreach ($gpuItem in $Script:SystemInfo.GPUs) {
+            $gpuLabel = if ($Script:SystemInfo.GPUs.Count -gt 1) { "GPU $gpuIndex" } else { "Graphics" }
+            $gpuLine = "$(ConvertTo-HtmlSafe $gpuItem.Name)"
+            if ($gpuItem.VRAM) { $gpuLine += " ($($gpuItem.VRAM))" }
+            if ($gpuItem.Driver -and $gpuItem.Driver -ne "N/A") { $gpuLine += " - Driver: $($gpuItem.Driver)" }
+            if ($gpuItem.Resolution -and $gpuItem.Resolution -ne "N/A") { $gpuLine += " @ $($gpuItem.Resolution)" }
+            $html += "                <div class=`"system-info-item`"><span class=`"label`">$gpuLabel</span><span class=`"value`">$gpuLine</span></div>`n"
+            $gpuIndex++
+        }
+    } else {
+        $html += "                <div class=`"system-info-item`"><span class=`"label`">Graphics</span><span class=`"value`">N/A</span></div>`n"
+    }
+
+    $html += @"
+                <div class="system-info-item"><span class="label">Uptime</span><span class="value">$($Script:SystemInfo.Uptime) &nbsp;(since $($Script:SystemInfo.LastBoot))</span></div>
             </div>
         </div>
 "@
@@ -5844,6 +6002,25 @@ function New-HtmlReport {
             AuditDate   = $Script:AuditDate
             Hostname    = $Script:Hostname
             RunAsAdmin  = (Test-IsAdmin)
+        }
+        SystemInformation = [ordered]@{
+            Hostname     = $Script:SystemInfo.Hostname
+            Domain       = $Script:SystemInfo.Domain
+            OSName       = $Script:SystemInfo.OSName
+            OSBuild      = $Script:SystemInfo.OSBuild
+            Architecture = $Script:SystemInfo.Architecture
+            Manufacturer = $Script:SystemInfo.Manufacturer
+            Model        = $Script:SystemInfo.Model
+            SerialNumber = $Script:SystemInfo.SerialNumber
+            BIOSVersion  = $Script:SystemInfo.BIOSVersion
+            BIOSDate     = $Script:SystemInfo.BIOSDate
+            CPU          = $Script:SystemInfo.CPU
+            CPUCores     = $Script:SystemInfo.CPUCores
+            CPUThreads   = $Script:SystemInfo.CPUThreads
+            TotalMemoryGB = $Script:SystemInfo.TotalMemoryGB
+            GPUs         = @($Script:SystemInfo.GPUs | ForEach-Object { $_.Name })
+            Uptime       = $Script:SystemInfo.Uptime
+            LastBoot     = $Script:SystemInfo.LastBoot
         }
         Summary = [ordered]@{
             TotalFindings = $Script:Findings.Count
