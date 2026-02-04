@@ -376,15 +376,41 @@ function Get-SystemInformation {
         -Details "Make/Model: $($Script:SystemInfo.Manufacturer) $($Script:SystemInfo.Model)`nSerial: $($Script:SystemInfo.SerialNumber)`nBIOS: $($Script:SystemInfo.BIOSVersion) ($($Script:SystemInfo.BIOSDate))`nCPU: $($Script:SystemInfo.CPU) ($($Script:SystemInfo.CPUCores)C/$($Script:SystemInfo.CPUThreads)T @ $($Script:SystemInfo.CPUMaxSpeed))`nRAM: $($Script:SystemInfo.TotalMemoryGB) GB$(if ($ramModules.Count -gt 0) { " [$($ramModules -join ' + ')]" })`nGPU: $(($gpuDetails | ForEach-Object { "$($_.Name) ($($_.VRAM))" }) -join '; ')`nUptime: $($Script:SystemInfo.Uptime) (since $lastBootStr)"
     
     # Virtual Machine Detection
+    # Strategy: use tiered indicators. Strong indicators (manufacturer/model, guest-only
+    # tools/registry) are definitive. Weak indicators (services, MACs) need corroboration.
+    # Physical OEM manufacturers are counter-indicators that prevent false positives
+    # on hosts running Hyper-V, VBS, or Credential Guard.
     $vmDetected = $false
     $vmPlatform = "Physical"
     $vmIndicators = @()
+    $isKnownPhysicalOEM = $false
+    $isHyperVHost = $false
     
     $mfr = ($Script:SystemInfo.Manufacturer).ToLower()
     $model = ($Script:SystemInfo.Model).ToLower()
     $biosVer = if ($Script:SystemInfo.BIOSVersion) { ($Script:SystemInfo.BIOSVersion).ToLower() } else { "" }
     
-    # Check manufacturer/model strings
+    # Known physical OEM manufacturers - these make VM detection far less likely
+    $physicalOEMs = @('dell', 'hewlett', 'lenovo', 'asus', 'acer', 'toshiba', 'samsung',
+                      'fujitsu', 'panasonic', 'sony', 'msi', 'gigabyte', 'razer', 'apple',
+                      'dynabook', 'getac', 'motion computing', 'nec', 'sharp', 'vaio',
+                      'alienware', 'system76', 'framework', 'surface')
+    foreach ($oem in $physicalOEMs) {
+        if ($mfr -match [regex]::Escape($oem) -or $model -match [regex]::Escape($oem)) {
+            $isKnownPhysicalOEM = $true
+            break
+        }
+    }
+    
+    # Check if this machine is a Hyper-V HOST (runs vmms management service)
+    $vmmsService = Get-Service -Name "vmms" -ErrorAction SilentlyContinue
+    if ($vmmsService) {
+        $isHyperVHost = $true
+        $vmIndicators += "Hyper-V Host: vmms service present ($($vmmsService.Status)) - this is a hypervisor HOST"
+    }
+    
+    # ---- STRONG indicators: manufacturer/model strings ----
+    # These are set by the hypervisor BIOS and are definitive for guests
     if ($mfr -match 'vmware' -or $model -match 'vmware') {
         $vmDetected = $true; $vmPlatform = "VMware"
         $vmIndicators += "Manufacturer/Model contains 'VMware'"
@@ -413,30 +439,29 @@ function Get-SystemInformation {
         $vmDetected = $true; $vmPlatform = "Amazon EC2"
         $vmIndicators += "Manufacturer/BIOS indicates Amazon EC2"
     }
-    elseif ($mfr -match 'google' -or $model -match 'google') {
+    elseif ($mfr -match 'google' -and ($model -match 'google' -or $model -match 'compute engine')) {
         $vmDetected = $true; $vmPlatform = "Google Cloud"
         $vmIndicators += "Manufacturer indicates Google Cloud"
     }
-    elseif ($biosVer -match 'vbox' -or $biosVer -match 'vmware' -or $biosVer -match 'virtual') {
+    elseif ($biosVer -match 'vbox' -or $biosVer -match 'vmware') {
         $vmDetected = $true; $vmPlatform = "Virtual Machine (BIOS)"
         $vmIndicators += "BIOS version contains virtualisation indicator"
     }
     
-    # Check for hypervisor via WMI
-    # NOTE: HypervisorPresent alone does NOT mean VM - physical hosts running Hyper-V,
-    # VBS, or Credential Guard will also report HypervisorPresent = True.
-    # Only use as a supporting indicator, not a standalone detection.
+    # HypervisorPresent - supporting indicator only, NOT standalone
+    # Physical hosts with Hyper-V role, VBS, or Credential Guard all set this
     if ($cs.HypervisorPresent -eq $true) {
         if ($vmDetected) {
             $vmIndicators += "HypervisorPresent: True (confirms VM)"
+        } elseif ($isHyperVHost) {
+            $vmIndicators += "HypervisorPresent: True (Hyper-V host role)"
         } else {
-            # Record it but don't flag as VM - likely a physical host with Hyper-V/VBS enabled
-            $vmIndicators += "HypervisorPresent: True (likely Hyper-V role, VBS, or Credential Guard on physical host)"
+            $vmIndicators += "HypervisorPresent: True (VBS/Credential Guard or hypervisor role)"
         }
     }
     
-    # Check SMBIOS system family and baseboard
-    if (-not $vmDetected -and $baseboard) {
+    # ---- STRONG indicators: baseboard (only if not a known OEM) ----
+    if (-not $vmDetected -and -not $isKnownPhysicalOEM -and $baseboard) {
         $bbProduct = if ($baseboard.Product) { $baseboard.Product.ToLower() } else { "" }
         $bbMfr = if ($baseboard.Manufacturer) { $baseboard.Manufacturer.ToLower() } else { "" }
         if ($bbProduct -match 'virtual|vmware|vbox|qemu|xen' -or $bbMfr -match 'virtual|vmware|vbox|qemu|xen') {
@@ -445,46 +470,78 @@ function Get-SystemInformation {
         }
     }
     
-    # Check for VM-specific services
-    $vmServices = @(
-        @{ Name = "vmtools";      Platform = "VMware" },
-        @{ Name = "vmtoolsd";     Platform = "VMware" },
+    # ---- STRONG indicators: guest-only tools and registry ----
+    # These only exist inside a VM guest, never on a host
+    $guestOnlyServices = @(
+        @{ Name = "vmtools";        Platform = "VMware" },
+        @{ Name = "vmtoolsd";       Platform = "VMware" },
         @{ Name = "VMUSBArbService"; Platform = "VMware" },
-        @{ Name = "vmicheartbeat"; Platform = "Hyper-V" },
-        @{ Name = "vmicshutdown"; Platform = "Hyper-V" },
-        @{ Name = "vmickvpexchange"; Platform = "Hyper-V" },
-        @{ Name = "vmicguestinterface"; Platform = "Hyper-V" },
-        @{ Name = "VBoxService";  Platform = "VirtualBox" },
-        @{ Name = "VBoxClient";   Platform = "VirtualBox" }
+        @{ Name = "VBoxService";    Platform = "VirtualBox" },
+        @{ Name = "VBoxClient";     Platform = "VirtualBox" }
     )
     
-    foreach ($svc in $vmServices) {
+    foreach ($svc in $guestOnlyServices) {
         $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
         if ($service) {
             if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = $svc.Platform }
-            $vmIndicators += "VM service found: $($svc.Name) ($($service.Status))"
+            $vmIndicators += "Guest agent: $($svc.Name) ($($service.Status))"
         }
     }
     
-    # Check for VM-specific registry keys
-    $vmRegChecks = @(
+    # Hyper-V integration services: these run on BOTH host and guest
+    # Only count as VM evidence if this is NOT a known physical OEM and NOT a Hyper-V host
+    $hvIntegrationServices = @("vmicheartbeat", "vmicshutdown", "vmickvpexchange", "vmicguestinterface",
+                                "vmicrdv", "vmictimesync", "vmicvmsession", "vmicvss")
+    $hvIntSvcFound = @()
+    foreach ($svcName in $hvIntegrationServices) {
+        $service = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($service) { $hvIntSvcFound += "$svcName ($($service.Status))" }
+    }
+    
+    if ($hvIntSvcFound.Count -gt 0) {
+        if ($vmDetected) {
+            $vmIndicators += "Hyper-V integration services: $($hvIntSvcFound -join ', ')"
+        } elseif ($isKnownPhysicalOEM -or $isHyperVHost) {
+            # Known OEM or Hyper-V host - these services are expected, not a VM indicator
+            $vmIndicators += "Hyper-V integration services present (expected on host/physical): $($hvIntSvcFound -join ', ')"
+        } else {
+            # Unknown manufacturer + integration services + no host indicator = likely guest
+            if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = "Hyper-V" }
+            $vmIndicators += "Hyper-V integration services (no physical OEM detected): $($hvIntSvcFound -join ', ')"
+        }
+    }
+    
+    # Guest-only registry keys
+    $guestOnlyRegKeys = @(
         @{ Path = "HKLM:\SOFTWARE\VMware, Inc.\VMware Tools"; Platform = "VMware" },
-        @{ Path = "HKLM:\SOFTWARE\Oracle\VirtualBox Guest Additions"; Platform = "VirtualBox" },
-        @{ Path = "HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters"; Platform = "Hyper-V" }
+        @{ Path = "HKLM:\SOFTWARE\Oracle\VirtualBox Guest Additions"; Platform = "VirtualBox" }
     )
     
-    foreach ($reg in $vmRegChecks) {
+    foreach ($reg in $guestOnlyRegKeys) {
         if (Test-Path $reg.Path) {
             if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = $reg.Platform }
-            $vmIndicators += "VM registry key: $($reg.Path)"
+            $vmIndicators += "Guest tools registry: $($reg.Path)"
         }
     }
     
-    # Check MAC address OUI for known VM vendors
+    # Hyper-V guest parameters key - this is guest-only (not present on hosts)
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters") {
+        if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = "Hyper-V" }
+        $vmIndicators += "Hyper-V guest registry: HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters"
+    }
+    
+    # ---- MAC address analysis ----
+    # On a physical host with Hyper-V, there will be a MIX of physical and virtual MACs.
+    # On a VM guest, ALL MACs will typically be virtual OUIs.
+    # So: only use MAC as a VM indicator if there are NO physical MACs present.
     try {
-        $nics = Get-CimInstance -ClassName Win32_NetworkAdapter -Filter "MACAddress IS NOT NULL" -ErrorAction SilentlyContinue
+        $nics = Get-CimInstance -ClassName Win32_NetworkAdapter -Filter "MACAddress IS NOT NULL AND PhysicalAdapter = True" -ErrorAction SilentlyContinue
         if ($nics) {
             $nicList = if ($nics -is [array]) { $nics } else { @($nics) }
+            $physicalMacCount = 0
+            $virtualMacCount = 0
+            $virtualMacDetails = @()
+            
             foreach ($nic in $nicList) {
                 if ($nic.MACAddress) {
                     $mac = $nic.MACAddress.ToUpper()
@@ -501,33 +558,65 @@ function Get-SystemInformation {
                         default { $null }
                     }
                     if ($vmMac) {
-                        if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = $vmMac }
-                        $vmIndicators += "VM MAC OUI: $mac ($($nic.Name)) -> $vmMac"
-                        break
+                        $virtualMacCount++
+                        $virtualMacDetails += "$mac ($($nic.Name)) -> $vmMac"
+                    } else {
+                        $physicalMacCount++
                     }
                 }
+            }
+            
+            if ($virtualMacCount -gt 0 -and $physicalMacCount -eq 0) {
+                # ALL MACs are virtual - strong VM indicator
+                if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = $virtualMacDetails[0].Split('>')[-1].Trim() }
+                $vmIndicators += "All NICs have VM MACs (no physical MACs): $($virtualMacDetails -join '; ')"
+            } elseif ($virtualMacCount -gt 0 -and $physicalMacCount -gt 0) {
+                # Mix of virtual and physical - this is a host with virtual switches
+                $vmIndicators += "Mixed MACs detected (physical host with virtual switch): $virtualMacCount virtual, $physicalMacCount physical"
             }
         }
     } catch { }
     
-    # Check for VM-specific hardware (disk, video)
+    # ---- Disk models ----
     try {
         $diskModels = Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Model
         if ($diskModels) {
             foreach ($disk in $diskModels) {
                 $diskLower = $disk.ToLower()
-                if ($diskLower -match 'vmware|virtual|vbox|qemu|xen') {
+                if ($diskLower -match 'vmware virtual|vbox harddisk|qemu harddisk|virtual hd|msft virtual disk|xen') {
                     if (-not $vmDetected) { $vmDetected = $true; $vmPlatform = "Virtual Machine (Disk)" }
-                    $vmIndicators += "VM disk: $disk"
+                    $vmIndicators += "Virtual disk: $disk"
                 }
             }
         }
     } catch { }
     
+    # ---- Final physical OEM sanity check ----
+    # If a known physical OEM (Dell, HP, Lenovo etc.) is the manufacturer and no strong
+    # guest-specific indicator was found, override any weak false-positive detections
+    if ($vmDetected -and $isKnownPhysicalOEM) {
+        # Check if we have a truly strong indicator or only weak ones
+        $hasStrongIndicator = $false
+        foreach ($ind in $vmIndicators) {
+            if ($ind -match 'Guest agent:|Guest tools registry:|Hyper-V guest registry:|Virtual disk:|All NICs have VM MACs|Model: Microsoft Virtual') {
+                $hasStrongIndicator = $true
+                break
+            }
+        }
+        if (-not $hasStrongIndicator) {
+            # Known OEM with only weak indicators - this is a physical machine
+            $vmDetected = $false
+            $vmPlatform = "Physical"
+            $vmIndicators += "Physical OEM override: $($Script:SystemInfo.Manufacturer) detected - weak VM indicators dismissed"
+        }
+    }
+    
     # Store in SystemInfo
     $Script:SystemInfo | Add-Member -NotePropertyName "IsVirtualMachine" -NotePropertyValue $vmDetected -Force
     $Script:SystemInfo | Add-Member -NotePropertyName "VMPlatform" -NotePropertyValue $vmPlatform -Force
     $Script:SystemInfo | Add-Member -NotePropertyName "VMIndicators" -NotePropertyValue $vmIndicators -Force
+    $Script:SystemInfo | Add-Member -NotePropertyName "IsHyperVHost" -NotePropertyValue $isHyperVHost -Force
+    $Script:SystemInfo | Add-Member -NotePropertyName "IsKnownOEM" -NotePropertyValue $isKnownPhysicalOEM -Force
     
     if ($vmDetected) {
         $detailStr = "Platform: $vmPlatform`nDetection indicators:`n$(($vmIndicators | ForEach-Object { "  - $_" }) -join "`n")"
@@ -568,9 +657,18 @@ function Get-SystemInformation {
                 -Details ($vmSecDetails -join "`n")
         }
     } else {
+        $physicalDesc = "No guest VM indicators detected - system is running on physical hardware"
+        $physicalDetail = "Manufacturer: $($Script:SystemInfo.Manufacturer)`nModel: $($Script:SystemInfo.Model)"
+        if ($isHyperVHost) {
+            $physicalDesc = "Physical hardware with Hyper-V host role installed"
+            $physicalDetail += "`nHyper-V Management Service (vmms): $($vmmsService.Status)"
+        }
+        if ($cs.HypervisorPresent -eq $true -and -not $isHyperVHost) {
+            $physicalDetail += "`nNote: HypervisorPresent is True (VBS/Credential Guard active)"
+        }
         Add-Finding -Category "System Info" -Name "Physical Hardware" -Risk "Info" `
-            -Description "No virtualisation indicators detected - system appears to be running on physical hardware" `
-            -Details "Manufacturer: $($Script:SystemInfo.Manufacturer)`nModel: $($Script:SystemInfo.Model)"
+            -Description $physicalDesc `
+            -Details $physicalDetail
     }
     
     # -- Battery / Form Factor Detection --
