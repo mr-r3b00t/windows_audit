@@ -1235,6 +1235,7 @@ function Test-MDMEnrollment {
         IsEnrolled = $false
         MDMProvider = $null
         EnrollmentType = $null
+        IsAzureADJoined = $false
         Details = @()
     }
     
