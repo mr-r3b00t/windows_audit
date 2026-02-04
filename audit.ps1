@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
     Windows Security Audit Tool - Compliance Edition v1.3.0
+    Copyright (C) Xservus Limited. All rights reserved.
     
 .DESCRIPTION
     A PowerShell 5.0 compatible security configuration auditing tool designed for 
@@ -37,8 +38,8 @@
     .\WinSecurityAudit.ps1 -ReportName "ClientAudit" -OutputPath "C:\Reports"
     
 .NOTES
-    Author: Security Audit Team
-    Version: 1.1.0
+    Copyright (C) Xservus Limited. All rights reserved.
+    Version: 1.3.0
     Requires: PowerShell 5.0+
     Purpose: Legal compliance auditing
 #>
@@ -6374,6 +6375,7 @@ function New-HtmlReport {
         <header class="header">
             <div>
                 <h1> Windows Security Audit Report</h1>
+                <div style="font-size: 12px; color: #6c757d; margin-top: 2px; margin-bottom: 8px;">Copyright &copy; Xservus Limited. All rights reserved.</div>
                 <div class="header-meta">
                     <div><strong>Hostname:</strong> $($Script:SystemInfo.Hostname)</div>
                     <div><strong>Audit Date:</strong> $($Script:AuditDate)</div>
@@ -7413,6 +7415,7 @@ $(if ($Script:PrivacyEnabled) {
         
         <footer class="footer">
             <p>Windows Security Audit Tool v$($Script:AuditVersion) | Generated: $($Script:AuditDate)</p>
+            <p>Copyright &copy; Xservus Limited. All rights reserved.</p>
             <p>This report is for authorized security compliance auditing purposes only.</p>
         </footer>
     </div>
@@ -7864,6 +7867,7 @@ function Start-SecurityAudit {
     
     +===================================================================+
     |     Windows Security Audit Tool - Compliance Edition v$Script:AuditVersion       |
+    |              Copyright (C) Xservus Limited                        |
     |                   For Authorized Security Audits                  |
     +===================================================================+
     |                                                                   |
