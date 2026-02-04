@@ -21,12 +21,20 @@
 .PARAMETER PrivacyMode
     Redact hostnames, usernames, IP addresses, MAC addresses, and serial numbers
     from the report. Can also be enabled interactively when the script starts.
+
+.PARAMETER ReportName
+    Custom prefix for the report filename. Hostname and timestamp are always appended.
+    Default: SecurityAudit  ->  SecurityAudit_HOSTNAME_20260204_120000.html
+    Example: -ReportName "Q1Audit"  ->  Q1Audit_HOSTNAME_20260204_120000.html
     
 .EXAMPLE
     .\WinSecurityAudit.ps1 -OutputPath "C:\AuditReports"
 
 .EXAMPLE
     .\WinSecurityAudit.ps1 -PrivacyMode -ExportJson
+
+.EXAMPLE
+    .\WinSecurityAudit.ps1 -ReportName "ClientAudit" -OutputPath "C:\Reports"
     
 .NOTES
     Author: Security Audit Team
@@ -50,7 +58,10 @@ param(
     [switch]$ExportJson,
     
     [Parameter()]
-    [switch]$PrivacyMode
+    [switch]$PrivacyMode,
+    
+    [Parameter(HelpMessage="Report filename prefix. Defaults to 'SecurityAudit_{hostname}_{date}'.")]
+    [string]$ReportName
 )
 
 #Requires -Version 5.0
@@ -7414,6 +7425,7 @@ $(if ($Script:PrivacyEnabled) {
             Hostname    = $Script:Hostname
             RunAsAdmin  = (Test-IsAdmin)
             PrivacyMode = $Script:PrivacyEnabled
+            ReportName  = if ($ReportName) { $ReportName -replace '\.(html|htm)$', '' } else { "SecurityAudit" }
         }
         SystemInformation = [ordered]@{
             Hostname     = $Script:SystemInfo.Hostname
@@ -7626,7 +7638,8 @@ $embeddedJson
                 + '_' + ('0' + now.getHours()).slice(-2)
                 + ('0' + now.getMinutes()).slice(-2)
                 + ('0' + now.getSeconds()).slice(-2);
-            var filename = 'SecurityAudit_' + hostname + '_' + ts + '.json';
+            var prefix = (_auditData.ReportMetadata && _auditData.ReportMetadata.ReportName) ? _auditData.ReportMetadata.ReportName : 'SecurityAudit';
+            var filename = prefix + '_' + hostname + '_' + ts + '.json';
             _auditData.ReportMetadata.ExportDate = now.toISOString();
             var blob = new Blob([JSON.stringify(_auditData, null, 2)], {type: 'application/json'});
             var a = document.createElement('a');
@@ -7666,7 +7679,13 @@ function Export-JsonReport {
     }
     
     $jsonHostname = if ($Script:PrivacyEnabled) { "REDACTED" } else { $Script:Hostname }
-    $jsonFile = Join-Path $JsonOutputPath "SecurityAudit_${jsonHostname}_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+    $jsonTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    if ($ReportName) {
+        $baseName = $ReportName -replace '\.(json)$', ''
+        $jsonFile = Join-Path $JsonOutputPath "${baseName}_${jsonHostname}_${jsonTimestamp}.json"
+    } else {
+        $jsonFile = Join-Path $JsonOutputPath "SecurityAudit_${jsonHostname}_${jsonTimestamp}.json"
+    }
     
     # Build the export object
     $exportData = [ordered]@{
@@ -7677,6 +7696,7 @@ function Export-JsonReport {
             Hostname        = $Script:Hostname
             RunAsAdmin      = (Test-IsAdmin)
             PrivacyMode     = $Script:PrivacyEnabled
+            ReportName      = if ($ReportName) { $ReportName -replace '\.(html|htm|json)$', '' } else { "SecurityAudit" }
         }
         
         SystemInformation = $Script:SystemInfo
@@ -8010,7 +8030,13 @@ function Start-SecurityAudit {
     }
     
     $reportHostname = if ($Script:PrivacyEnabled) { "REDACTED" } else { $Script:Hostname }
-    $reportFile = Join-Path $OutputPath "SecurityAudit_${reportHostname}_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+    $reportTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    if ($ReportName) {
+        $baseName = $ReportName -replace '\.(html|htm)$', ''
+        $reportFile = Join-Path $OutputPath "${baseName}_${reportHostname}_${reportTimestamp}.html"
+    } else {
+        $reportFile = Join-Path $OutputPath "SecurityAudit_${reportHostname}_${reportTimestamp}.html"
+    }
     $html | Out-File -FilePath $reportFile -Encoding UTF8
     
     Write-AuditLog "Audit complete!" -Level "SUCCESS"
