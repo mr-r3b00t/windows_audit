@@ -17,9 +17,16 @@
     
 .PARAMETER Quiet
     Suppress console output during scan.
+
+.PARAMETER PrivacyMode
+    Redact hostnames, usernames, IP addresses, MAC addresses, and serial numbers
+    from the report. Can also be enabled interactively when the script starts.
     
 .EXAMPLE
     .\WinSecurityAudit.ps1 -OutputPath "C:\AuditReports"
+
+.EXAMPLE
+    .\WinSecurityAudit.ps1 -PrivacyMode -ExportJson
     
 .NOTES
     Author: Security Audit Team
@@ -40,7 +47,10 @@ param(
     [switch]$Quiet,
     
     [Parameter()]
-    [switch]$ExportJson
+    [switch]$ExportJson,
+    
+    [Parameter()]
+    [switch]$PrivacyMode
 )
 
 #Requires -Version 5.0
@@ -53,6 +63,8 @@ $Script:AuditVersion = "1.3.0"
 $Script:AuditDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 $Script:Hostname = $env:COMPUTERNAME
 $Script:Findings = [System.Collections.ArrayList]::new()
+$Script:PrivacyEnabled = $false
+$Script:PrivacyRedactions = @{}
 
 # Load System.Web for HTML encoding (required for report generation)
 Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
@@ -97,6 +109,171 @@ function Write-AuditLog {
         }
         Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
     }
+}
+
+function Initialize-PrivacyMode {
+    <#
+    .SYNOPSIS
+        Builds the redaction lookup table from live system data.
+        Called once after Get-SystemInformation so all values are available.
+    #>
+    if (-not $Script:PrivacyEnabled) { return }
+    
+    Write-AuditLog "Privacy Mode: Building redaction table..." -Level "INFO"
+    
+    # Hostname / computer name
+    $names = @($env:COMPUTERNAME)
+    if ($Script:SystemInfo.Hostname) { $names += $Script:SystemInfo.Hostname }
+    if ($env:USERDNSDOMAIN) { $names += $env:USERDNSDOMAIN }
+    if ($Script:SystemInfo.Domain -and $Script:SystemInfo.Domain -ne 'WORKGROUP') {
+        $names += $Script:SystemInfo.Domain
+    }
+    foreach ($n in ($names | Select-Object -Unique)) {
+        if ($n -and $n.Length -ge 2) {
+            $Script:PrivacyRedactions[$n] = "[REDACTED-HOST]"
+        }
+    }
+    
+    # Current user
+    $usernames = @($env:USERNAME)
+    if ($env:USERDOMAIN -and $env:USERDOMAIN -ne $env:COMPUTERNAME) {
+        $Script:PrivacyRedactions[$env:USERDOMAIN] = "[REDACTED-DOMAIN]"
+    }
+    
+    # All local user accounts
+    try {
+        $localUsers = Get-CimInstance -ClassName Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue
+        if ($localUsers) {
+            $luList = if ($localUsers -is [array]) { $localUsers } else { @($localUsers) }
+            foreach ($lu in $luList) {
+                if ($lu.Name -and $lu.Name.Length -ge 2) {
+                    $usernames += $lu.Name
+                }
+            }
+        }
+    } catch { }
+    
+    # All user profile paths -> extract usernames from C:\Users\<name>
+    try {
+        $profiles = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue
+        if ($profiles) {
+            $pList = if ($profiles -is [array]) { $profiles } else { @($profiles) }
+            foreach ($p in $pList) {
+                if ($p.LocalPath -match '\\Users\\(.+)$') {
+                    $profName = $Matches[1]
+                    if ($profName -and $profName.Length -ge 2 -and $profName -notin $Script:SystemAccounts) {
+                        $usernames += $profName
+                    }
+                }
+            }
+        }
+    } catch { }
+    
+    foreach ($u in ($usernames | Select-Object -Unique)) {
+        if ($u -and $u.Length -ge 2) {
+            $Script:PrivacyRedactions[$u] = "[REDACTED-USER]"
+        }
+    }
+    
+    # Serial number
+    if ($Script:SystemInfo.SerialNumber -and $Script:SystemInfo.SerialNumber.Length -ge 3) {
+        $Script:PrivacyRedactions[$Script:SystemInfo.SerialNumber] = "[REDACTED-SERIAL]"
+    }
+    
+    # Disk serial numbers
+    if ($Script:DiskInventory) {
+        foreach ($d in $Script:DiskInventory) {
+            if ($d.SerialNumber -and $d.SerialNumber.Length -ge 3) {
+                $Script:PrivacyRedactions[$d.SerialNumber] = "[REDACTED-DISK-SERIAL]"
+            }
+        }
+    }
+    
+    # IP addresses (local)
+    try {
+        $ipAddrs = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" -ErrorAction SilentlyContinue
+        if ($ipAddrs) {
+            $ipList = if ($ipAddrs -is [array]) { $ipAddrs } else { @($ipAddrs) }
+            foreach ($adapter in $ipList) {
+                if ($adapter.IPAddress) {
+                    foreach ($ip in $adapter.IPAddress) {
+                        if ($ip -and $ip -ne '127.0.0.1' -and $ip -ne '::1' -and $ip.Length -ge 3) {
+                            $Script:PrivacyRedactions[$ip] = "[REDACTED-IP]"
+                        }
+                    }
+                }
+                if ($adapter.DefaultIPGateway) {
+                    foreach ($gw in $adapter.DefaultIPGateway) {
+                        if ($gw -and $gw.Length -ge 3) {
+                            $Script:PrivacyRedactions[$gw] = "[REDACTED-GATEWAY]"
+                        }
+                    }
+                }
+                if ($adapter.DNSServerSearchOrder) {
+                    foreach ($dns in $adapter.DNSServerSearchOrder) {
+                        if ($dns -and $dns.Length -ge 3) {
+                            $Script:PrivacyRedactions[$dns] = "[REDACTED-DNS]"
+                        }
+                    }
+                }
+                if ($adapter.DHCPServer -and $adapter.DHCPServer.Length -ge 3) {
+                    $Script:PrivacyRedactions[$adapter.DHCPServer] = "[REDACTED-DHCP]"
+                }
+            }
+        }
+    } catch { }
+    
+    # MAC addresses
+    try {
+        $macNics = Get-CimInstance -ClassName Win32_NetworkAdapter -Filter "MACAddress IS NOT NULL" -ErrorAction SilentlyContinue
+        if ($macNics) {
+            $macList = if ($macNics -is [array]) { $macNics } else { @($macNics) }
+            foreach ($nic in $macList) {
+                if ($nic.MACAddress -and $nic.MACAddress.Length -ge 8) {
+                    $Script:PrivacyRedactions[$nic.MACAddress] = "[REDACTED-MAC]"
+                    # Also redact hyphen format
+                    $hyphenMac = $nic.MACAddress -replace ':', '-'
+                    if ($hyphenMac -ne $nic.MACAddress) {
+                        $Script:PrivacyRedactions[$hyphenMac] = "[REDACTED-MAC]"
+                    }
+                }
+            }
+        }
+    } catch { }
+    
+    # Hyper-V host/VM names from registry
+    $hvHostName = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters" -Name "HostName" -Default $null
+    if ($hvHostName -and $hvHostName.Length -ge 2) { $Script:PrivacyRedactions[$hvHostName] = "[REDACTED-HV-HOST]" }
+    $hvVmName = Get-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters" -Name "VirtualMachineName" -Default $null
+    if ($hvVmName -and $hvVmName.Length -ge 2) { $Script:PrivacyRedactions[$hvVmName] = "[REDACTED-VM-NAME]" }
+    
+    # Sort redactions by length descending so longer matches are replaced first
+    # (prevents partial replacements, e.g. replacing "ADMIN" inside "ADMIN-PC")
+    $Script:PrivacyRedactionKeys = $Script:PrivacyRedactions.Keys | Sort-Object { $_.Length } -Descending
+    
+    Write-AuditLog "Privacy Mode: $($Script:PrivacyRedactions.Count) redaction patterns loaded" -Level "INFO"
+}
+
+function Protect-PrivacyString {
+    <#
+    .SYNOPSIS
+        Applies all privacy redactions to a string. Returns the redacted string.
+        If privacy mode is disabled, returns the input unchanged.
+    #>
+    param([string]$InputString)
+    
+    if (-not $Script:PrivacyEnabled -or -not $InputString -or $InputString.Length -eq 0) {
+        return $InputString
+    }
+    
+    $result = $InputString
+    foreach ($key in $Script:PrivacyRedactionKeys) {
+        if ($result -match [regex]::Escape($key)) {
+            $result = $result -replace [regex]::Escape($key), $Script:PrivacyRedactions[$key]
+        }
+    }
+    
+    return $result
 }
 
 function Add-Finding {
@@ -6191,6 +6368,9 @@ function New-HtmlReport {
                     <div><strong>Auditor:</strong> $($Script:SystemInfo.CurrentUser)</div>
                     <div><strong>Tool Version:</strong> $($Script:AuditVersion)</div>
                     <div><strong>Privileges:</strong> $headerAdminStatus</div>
+$(if ($Script:PrivacyEnabled) {
+    "                    <div><strong>Privacy Mode:</strong> <span style='background: #6f42c1; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px;'>ENABLED - Data Redacted</span></div>"
+})
                 </div>
                 <div style="margin-top: 10px;">
                     <button onclick="exportJson()" style="background: #28a745; color: white; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600;">Export JSON</button>
@@ -7232,6 +7412,7 @@ function New-HtmlReport {
             AuditDate   = $Script:AuditDate
             Hostname    = $Script:Hostname
             RunAsAdmin  = (Test-IsAdmin)
+            PrivacyMode = $Script:PrivacyEnabled
         }
         SystemInformation = [ordered]@{
             Hostname     = $Script:SystemInfo.Hostname
@@ -7483,7 +7664,8 @@ function Export-JsonReport {
         New-Item -ItemType Directory -Path $JsonOutputPath -Force | Out-Null
     }
     
-    $jsonFile = Join-Path $JsonOutputPath "SecurityAudit_$($Script:Hostname)_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+    $jsonHostname = if ($Script:PrivacyEnabled) { "REDACTED" } else { $Script:Hostname }
+    $jsonFile = Join-Path $JsonOutputPath "SecurityAudit_${jsonHostname}_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
     
     # Build the export object
     $exportData = [ordered]@{
@@ -7493,6 +7675,7 @@ function Export-JsonReport {
             ExportDate      = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
             Hostname        = $Script:Hostname
             RunAsAdmin      = (Test-IsAdmin)
+            PrivacyMode     = $Script:PrivacyEnabled
         }
         
         SystemInformation = $Script:SystemInfo
@@ -7668,9 +7851,29 @@ function Start-SecurityAudit {
         Write-Host $banner -ForegroundColor Cyan
     }
     
+    # Privacy mode prompt (unless already set via -PrivacyMode parameter)
+    if (-not $PrivacyMode -and -not $Quiet) {
+        Write-Host ""
+        Write-Host "  Privacy Mode redacts hostnames, usernames, IP addresses," -ForegroundColor White
+        Write-Host "  MAC addresses, and serial numbers from the report." -ForegroundColor White
+        Write-Host ""
+        $privacyChoice = Read-Host "  Enable Privacy Mode? (Y/N) [N]"
+        if ($privacyChoice -match '^[Yy]') {
+            $Script:PrivacyEnabled = $true
+            Write-Host ""
+            Write-Host "  [*] Privacy Mode ENABLED - sensitive data will be redacted" -ForegroundColor Green
+            Write-Host ""
+        }
+    } elseif ($PrivacyMode) {
+        $Script:PrivacyEnabled = $true
+    }
+    
     Write-AuditLog "Starting security audit on $($env:COMPUTERNAME)" -Level "INFO"
     Write-AuditLog "Running as: $($env:USERDOMAIN)\$($env:USERNAME)" -Level "INFO"
     Write-AuditLog "Admin privileges: $(Test-IsAdmin)" -Level "INFO"
+    if ($Script:PrivacyEnabled) {
+        Write-AuditLog "Privacy Mode: ENABLED" -Level "INFO"
+    }
     
     if (-not (Test-IsAdmin)) {
         Write-AuditLog "WARNING: Running without admin privileges. Some checks may be limited." -Level "WARN"
@@ -7738,23 +7941,93 @@ function Start-SecurityAudit {
     # Generate Cyber Essentials Summary after all modules have run
     Get-CyberEssentialsSummary
     
+    # Initialize privacy redactions now that all data has been gathered
+    Initialize-PrivacyMode
+    
+    # Apply privacy redactions to all findings before report generation
+    if ($Script:PrivacyEnabled) {
+        Write-AuditLog "Privacy Mode: Redacting findings..." -Level "INFO"
+        foreach ($finding in $Script:Findings) {
+            $finding.Name = Protect-PrivacyString $finding.Name
+            $finding.Description = Protect-PrivacyString $finding.Description
+            $finding.Details = Protect-PrivacyString $finding.Details
+            if ($finding.Recommendation) { $finding.Recommendation = Protect-PrivacyString $finding.Recommendation }
+        }
+        
+        # Redact SystemInfo fields
+        $Script:SystemInfo.Hostname = Protect-PrivacyString $Script:SystemInfo.Hostname
+        $Script:SystemInfo.Domain = Protect-PrivacyString $Script:SystemInfo.Domain
+        $Script:SystemInfo.SerialNumber = Protect-PrivacyString $Script:SystemInfo.SerialNumber
+        $Script:Hostname = Protect-PrivacyString $Script:Hostname
+        
+        # Redact disk serials
+        if ($Script:DiskInventory) {
+            foreach ($d in $Script:DiskInventory) {
+                $d.SerialNumber = Protect-PrivacyString $d.SerialNumber
+            }
+        }
+        
+        # Redact VM indicators
+        if ($Script:SystemInfo.VMIndicators) {
+            $Script:SystemInfo.VMIndicators = @($Script:SystemInfo.VMIndicators | ForEach-Object { Protect-PrivacyString $_ })
+        }
+        
+        # Redact battery details
+        if ($Script:SystemInfo.BatteryDetails) {
+            $Script:SystemInfo.BatteryDetails = @($Script:SystemInfo.BatteryDetails | ForEach-Object { Protect-PrivacyString $_ })
+        }
+        
+        # Redact software inventory installed-for users
+        if ($Script:SoftwareInventory) {
+            foreach ($sw in $Script:SoftwareInventory) {
+                if ($sw.PSObject.Properties['InstalledFor']) {
+                    $sw.InstalledFor = Protect-PrivacyString $sw.InstalledFor
+                }
+            }
+        }
+        
+        # Redact patch history InstalledBy
+        if ($Script:PatchHistory) {
+            foreach ($ph in $Script:PatchHistory) {
+                if ($ph.InstalledBy) { $ph.InstalledBy = Protect-PrivacyString $ph.InstalledBy }
+            }
+        }
+    }
+    
     # Generate HTML report
     $html = New-HtmlReport
+    
+    # Final pass: redact any remaining occurrences in the full HTML
+    if ($Script:PrivacyEnabled) {
+        Write-AuditLog "Privacy Mode: Final HTML redaction pass..." -Level "INFO"
+        $html = Protect-PrivacyString $html
+    }
     
     # Ensure output directory exists
     if (-not (Test-Path $OutputPath)) {
         New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
     }
     
-    $reportFile = Join-Path $OutputPath "SecurityAudit_$($Script:Hostname)_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+    $reportHostname = if ($Script:PrivacyEnabled) { "REDACTED" } else { $Script:Hostname }
+    $reportFile = Join-Path $OutputPath "SecurityAudit_${reportHostname}_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
     $html | Out-File -FilePath $reportFile -Encoding UTF8
     
     Write-AuditLog "Audit complete!" -Level "SUCCESS"
     Write-AuditLog "Report saved to: $reportFile" -Level "INFO"
+    if ($Script:PrivacyEnabled) {
+        Write-AuditLog "Privacy Mode: Report has been redacted" -Level "INFO"
+    }
     
     # Export JSON if requested via CLI parameter
     if ($ExportJson) {
         $jsonFile = Export-JsonReport -JsonOutputPath $OutputPath
+        # Redact JSON file contents
+        if ($Script:PrivacyEnabled -and (Test-Path $jsonFile)) {
+            Write-AuditLog "Privacy Mode: Redacting JSON export..." -Level "INFO"
+            $jsonContent = Get-Content -Path $jsonFile -Raw -Encoding UTF8
+            $jsonContent = Protect-PrivacyString $jsonContent
+            $jsonContent | Out-File -FilePath $jsonFile -Encoding UTF8 -Force
+        }
         Write-AuditLog "JSON exported to: $jsonFile" -Level "INFO"
     }
     
