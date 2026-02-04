@@ -6379,6 +6379,7 @@ function New-HtmlReport {
                     <div><strong>Audit Date:</strong> $($Script:AuditDate)</div>
                     <div><strong>Auditor:</strong> $($Script:SystemInfo.CurrentUser)</div>
                     <div><strong>Tool Version:</strong> $($Script:AuditVersion)</div>
+                    <div><strong>Platform:</strong> $(if ($Script:PlatformInfo) { "$($Script:PlatformInfo.WinVersion) (Build $($Script:PlatformInfo.OSBuild))$(if ($Script:PlatformInfo.IsHome) { ' - Home' })" } else { $Script:SystemInfo.OSName })</div>
                     <div><strong>Privileges:</strong> $headerAdminStatus</div>
 $(if ($Script:PrivacyEnabled) {
     "                    <div><strong>Privacy Mode:</strong> <span style='background: #6f42c1; color: white; padding: 2px 10px; border-radius: 4px; font-size: 12px;'>ENABLED - Data Redacted</span></div>"
@@ -7865,6 +7866,20 @@ function Start-SecurityAudit {
     |     Windows Security Audit Tool - Compliance Edition v$Script:AuditVersion       |
     |                   For Authorized Security Audits                  |
     +===================================================================+
+    |                                                                   |
+    |  Supported Platforms:                                             |
+    |    Windows 10 (1607+)    - Pro / Enterprise / Education           |
+    |    Windows 11            - Pro / Enterprise / Education           |
+    |    Windows Server 2016 / 2019 / 2022 / 2025                      |
+    |                                                                   |
+    |  Requirements:                                                    |
+    |    PowerShell 5.0+       Run as Administrator (recommended)       |
+    |                                                                   |
+    |  Notes:                                                           |
+    |    Home editions: BitLocker and Group Policy checks unavailable   |
+    |    Non-admin: Some security checks will return limited results    |
+    |                                                                   |
+    +===================================================================+
     
 "@
     
@@ -7872,7 +7887,146 @@ function Start-SecurityAudit {
         Write-Host $banner -ForegroundColor Cyan
     }
     
-    # Privacy mode prompt (unless already set via -PrivacyMode parameter)
+    # ---- Platform compatibility check ----
+    $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $osCaption = if ($osInfo) { $osInfo.Caption } else { "" }
+    $osBuild = if ($osInfo) { [int]($osInfo.BuildNumber) } else { 0 }
+    $osVersion = if ($osInfo) { $osInfo.Version } else { "" }
+    $psVersion = $PSVersionTable.PSVersion
+    
+    $platformOK = $true
+    $platformWarnings = @()
+    $isHomeEdition = $false
+    $isServerOS = $false
+    
+    # Check PowerShell version
+    if ($psVersion.Major -lt 5) {
+        $platformOK = $false
+        Write-Host "  [X] UNSUPPORTED: PowerShell $($psVersion.ToString()) detected. Version 5.0+ required." -ForegroundColor Red
+        Write-Host "      Install Windows Management Framework 5.1 from:" -ForegroundColor Red
+        Write-Host "      https://aka.ms/WMF5Download" -ForegroundColor Yellow
+        Write-Host ""
+        return
+    }
+    
+    # Check OS type - must be Windows
+    if ($env:OS -ne "Windows_NT") {
+        $platformOK = $false
+        Write-Host "  [X] UNSUPPORTED: This tool requires Windows. Detected: $($env:OS)" -ForegroundColor Red
+        Write-Host ""
+        return
+    }
+    
+    # Determine OS type and build
+    if ($osCaption -match 'Server') {
+        $isServerOS = $true
+        # Server 2016 = build 14393, Server 2019 = 17763, Server 2022 = 20348, Server 2025 = 26100
+        if ($osBuild -lt 14393) {
+            $platformOK = $false
+            Write-Host "  [X] UNSUPPORTED: $osCaption (Build $osBuild)" -ForegroundColor Red
+            Write-Host "      Minimum supported: Windows Server 2016 (Build 14393)" -ForegroundColor Red
+            Write-Host ""
+            return
+        }
+    } else {
+        # Desktop OS
+        if ($osCaption -match 'Home') {
+            $isHomeEdition = $true
+            $platformWarnings += "Home edition: BitLocker and Group Policy checks will be unavailable"
+        }
+        
+        # Windows 10 1607 = build 14393, Windows 11 = build 22000+
+        if ($osBuild -lt 14393) {
+            # Check if it's Windows 7/8.x
+            if ($osCaption -match 'Windows 7') {
+                $platformOK = $false
+                Write-Host "  [X] UNSUPPORTED: Windows 7 is not supported" -ForegroundColor Red
+                Write-Host "      Minimum supported: Windows 10 version 1607 (Build 14393)" -ForegroundColor Red
+            } elseif ($osCaption -match 'Windows 8') {
+                $platformOK = $false
+                Write-Host "  [X] UNSUPPORTED: Windows 8/8.1 is not supported" -ForegroundColor Red
+                Write-Host "      Minimum supported: Windows 10 version 1607 (Build 14393)" -ForegroundColor Red
+            } else {
+                $platformOK = $false
+                Write-Host "  [X] UNSUPPORTED: $osCaption (Build $osBuild)" -ForegroundColor Red
+                Write-Host "      Minimum supported: Windows 10 version 1607 (Build 14393)" -ForegroundColor Red
+            }
+            Write-Host ""
+            return
+        }
+    }
+    
+    # Determine Windows version name for display
+    $osDisplayName = $osCaption
+    $winVersion = ""
+    if (-not $isServerOS) {
+        if ($osBuild -ge 26100) { $winVersion = "Windows 11 24H2" }
+        elseif ($osBuild -ge 22631) { $winVersion = "Windows 11 23H2" }
+        elseif ($osBuild -ge 22621) { $winVersion = "Windows 11 22H2" }
+        elseif ($osBuild -ge 22000) { $winVersion = "Windows 11 21H2" }
+        elseif ($osBuild -ge 19045) { $winVersion = "Windows 10 22H2" }
+        elseif ($osBuild -ge 19044) { $winVersion = "Windows 10 21H2" }
+        elseif ($osBuild -ge 19043) { $winVersion = "Windows 10 21H1" }
+        elseif ($osBuild -ge 19042) { $winVersion = "Windows 10 20H2" }
+        elseif ($osBuild -ge 19041) { $winVersion = "Windows 10 2004" }
+        elseif ($osBuild -ge 18363) { $winVersion = "Windows 10 1909" }
+        elseif ($osBuild -ge 18362) { $winVersion = "Windows 10 1903" }
+        elseif ($osBuild -ge 17763) { $winVersion = "Windows 10 1809" }
+        elseif ($osBuild -ge 17134) { $winVersion = "Windows 10 1803" }
+        elseif ($osBuild -ge 16299) { $winVersion = "Windows 10 1709" }
+        elseif ($osBuild -ge 15063) { $winVersion = "Windows 10 1703" }
+        elseif ($osBuild -ge 14393) { $winVersion = "Windows 10 1607" }
+    } else {
+        if ($osBuild -ge 26100) { $winVersion = "Windows Server 2025" }
+        elseif ($osBuild -ge 20348) { $winVersion = "Windows Server 2022" }
+        elseif ($osBuild -ge 17763) { $winVersion = "Windows Server 2019" }
+        elseif ($osBuild -ge 14393) { $winVersion = "Windows Server 2016" }
+    }
+    
+    # Check for CIM availability (required for most checks)
+    $cimAvailable = $true
+    try {
+        $null = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+    } catch {
+        $cimAvailable = $false
+        $platformWarnings += "WMI/CIM not responding - many checks will fail"
+    }
+    
+    # Display platform status
+    if (-not $Quiet) {
+        Write-Host "  Platform Check:" -ForegroundColor White
+        $editionLabel = if ($isHomeEdition) { " (Home)" } else { "" }
+        Write-Host "    [OK] $winVersion${editionLabel} (Build $osBuild)" -ForegroundColor Green
+        Write-Host "    [OK] PowerShell $($psVersion.ToString())" -ForegroundColor Green
+        if ($cimAvailable) {
+            Write-Host "    [OK] WMI/CIM subsystem" -ForegroundColor Green
+        } else {
+            Write-Host "    [!!] WMI/CIM subsystem not responding" -ForegroundColor Red
+        }
+        if (Test-IsAdmin) {
+            Write-Host "    [OK] Running as Administrator" -ForegroundColor Green
+        } else {
+            Write-Host "    [!!] NOT running as Administrator - results will be limited" -ForegroundColor Yellow
+        }
+        foreach ($warn in $platformWarnings) {
+            Write-Host "    [!!] $warn" -ForegroundColor Yellow
+        }
+        Write-Host ""
+    }
+    
+    # Store for use in report
+    $Script:PlatformInfo = [PSCustomObject]@{
+        OSCaption    = $osCaption
+        OSBuild      = $osBuild
+        OSVersion    = $osVersion
+        WinVersion   = $winVersion
+        IsServer     = $isServerOS
+        IsHome       = $isHomeEdition
+        PSVersion    = $psVersion.ToString()
+        CIMAvailable = $cimAvailable
+    }
+    
+    # ---- Privacy mode prompt ----
     if (-not $PrivacyMode -and -not $Quiet) {
         Write-Host ""
         Write-Host "  Privacy Mode redacts hostnames, usernames, IP addresses," -ForegroundColor White
